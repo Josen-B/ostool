@@ -1,13 +1,16 @@
-use std::{env::current_dir, path::PathBuf, process::ExitCode};
+use std::{path::PathBuf, process::ExitCode, sync::OnceLock};
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use clap::*;
+use colored::Colorize as _;
 
 use log::info;
 use ostool::{
+    Tool, ToolConfig,
     build::{self, CargoRunnerKind},
-    ctx::AppContext,
+    logger,
     menuconfig::{MenuConfigHandler, MenuConfigMode},
+    resolve_manifest_context,
     run::{qemu::RunQemuArgs, uboot::RunUbootArgs},
 };
 
@@ -15,10 +18,12 @@ use ostool::{
 #[command(version, about, long_about = None)]
 struct Cli {
     #[arg(short, long)]
-    workdir: Option<PathBuf>,
+    manifest: Option<PathBuf>,
     #[command(subcommand)]
     command: SubCommands,
 }
+
+static LOG_PATH: OnceLock<PathBuf> = OnceLock::new();
 
 #[derive(Subcommand)]
 enum SubCommands {
@@ -55,6 +60,8 @@ pub struct QemuArgs {
     /// Path to the qemu configuration file
     ///
     /// Default behavior when not specified:
+    /// - Cargo build system: use the target package directory
+    /// - Custom build system: use the workspace directory
     /// - With architecture detected: .qemu-{arch}.toml (e.g., .qemu-aarch64.toml)
     /// - Without architecture: .qemu.toml
     #[arg(short, long)]
@@ -78,46 +85,34 @@ async fn main() -> ExitCode {
     match try_main().await {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
-            eprintln!("Error: {err:#}");
-            eprintln!("\nTrace:\n{err:?}");
+            report_error(&err);
             ExitCode::FAILURE
         }
     }
 }
 
 async fn try_main() -> Result<()> {
-    #[cfg(not(feature = "ui-log"))]
-    {
-        env_logger::builder()
-            .filter_level(log::LevelFilter::Info)
-            .parse_default_env()
-            .init();
-    }
-
     let cli = Cli::parse();
+    let manifest = resolve_manifest_context(cli.manifest.clone())?;
+    let log_path = logger::init_file_logger(&manifest.workspace_dir)?;
+    let _ = LOG_PATH.set(log_path.clone());
+    info!(
+        "Logging initialized at {} for manifest {}",
+        log_path.display(),
+        manifest.manifest_path.display()
+    );
 
-    let pwd = current_dir().context("failed to get current working directory")?;
-
-    let workspace_folder = match cli.workdir {
-        Some(dir) => dir,
-        None => pwd.clone(),
-    };
-
-    let mut ctx = AppContext {
-        paths: ostool::ctx::PathConfig {
-            workspace: workspace_folder.clone(),
-            manifest: workspace_folder.clone(),
-            ..Default::default()
-        },
+    let mut tool = Tool::new(ToolConfig {
+        manifest: cli.manifest,
         ..Default::default()
-    };
+    })?;
 
     match cli.command {
         SubCommands::Build { config } => {
-            ctx.build(config).await?;
+            tool.build(config).await?;
         }
         SubCommands::Run(args) => {
-            let config = ctx.prepare_build_config(args.config, false).await?;
+            let config = tool.prepare_build_config(args.config, false).await?;
             match config.system {
                 build::config::BuildSystem::Cargo(config) => {
                     let kind = match args.command {
@@ -125,46 +120,45 @@ async fn try_main() -> Result<()> {
                             qemu_config: qemu_args.qemu_config,
                             debug: qemu_args.debug,
                             dtb_dump: qemu_args.dtb_dump,
+                            to_bin: None,
+                            args: vec![],
+                            success_regex: vec![],
+                            fail_regex: vec![],
                         },
                         RunSubCommands::Uboot(uboot_args) => CargoRunnerKind::Uboot {
                             uboot_config: uboot_args.uboot_config,
                         },
                     };
-                    ctx.cargo_run(&config, &kind).await?;
+                    tool.cargo_run(&config, &kind).await?;
                 }
                 build::config::BuildSystem::Custom(custom_cfg) => {
-                    ctx.shell_run_cmd(&custom_cfg.build_cmd)?;
-                    ctx.set_elf_path(custom_cfg.elf_path.clone().into()).await?;
+                    tool.shell_run_cmd(&custom_cfg.build_cmd)?;
+                    tool.set_elf_path(custom_cfg.elf_path.clone().into())
+                        .await?;
                     info!(
                         "ELF {:?}: {}",
-                        ctx.arch,
-                        ctx.paths.artifacts.elf.as_ref().unwrap().display()
+                        tool.ctx().arch,
+                        tool.ctx().artifacts.elf.as_ref().unwrap().display()
                     );
 
                     if custom_cfg.to_bin {
-                        ctx.objcopy_output_bin()?;
+                        tool.objcopy_output_bin()?;
                     }
 
                     match args.command {
                         RunSubCommands::Qemu(qemu_args) => {
-                            ostool::run::qemu::run_qemu(
-                                ctx,
-                                RunQemuArgs {
-                                    qemu_config: qemu_args.qemu_config,
-                                    dtb_dump: qemu_args.dtb_dump,
-                                    show_output: true,
-                                },
-                            )
+                            tool.run_qemu(RunQemuArgs {
+                                qemu_config: qemu_args.qemu_config,
+                                dtb_dump: qemu_args.dtb_dump,
+                                show_output: true,
+                            })
                             .await?;
                         }
                         RunSubCommands::Uboot(uboot_args) => {
-                            ostool::run::uboot::run_uboot(
-                                ctx,
-                                RunUbootArgs {
-                                    config: uboot_args.uboot_config,
-                                    show_output: true,
-                                },
-                            )
+                            tool.run_uboot(RunUbootArgs {
+                                config: uboot_args.uboot_config,
+                                show_output: true,
+                            })
                             .await?;
                         }
                     }
@@ -172,11 +166,26 @@ async fn try_main() -> Result<()> {
             }
         }
         SubCommands::Menuconfig { mode } => {
-            MenuConfigHandler::handle_menuconfig(&mut ctx, mode).await?;
+            MenuConfigHandler::handle_menuconfig(&mut tool, mode).await?;
         }
     }
 
     Ok(())
+}
+
+fn report_error(err: &anyhow::Error) {
+    log::error!("{err:#}");
+    log::error!("Trace:\n{err:?}");
+
+    println!("{}", format!("Error: {err:#}").red().bold());
+    println!("{}", format!("\nTrace:\n{err:?}").red());
+
+    if let Some(log_path) = LOG_PATH.get() {
+        println!(
+            "{}",
+            format!("Log file: {}", log_path.display()).yellow().bold()
+        );
+    }
 }
 
 impl From<QemuArgs> for RunQemuArgs {

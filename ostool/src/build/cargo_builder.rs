@@ -16,10 +16,16 @@ use cargo_metadata::{Message, PackageId};
 use colored::Colorize;
 
 use crate::{
+    Tool,
     build::{config::Cargo, someboot},
-    ctx::AppContext,
     utils::{Command, PathResultExt},
 };
+
+#[derive(Debug, Clone)]
+struct ResolvedCargoArtifact {
+    elf_path: PathBuf,
+    cargo_artifact_dir: PathBuf,
+}
 
 /// A builder for constructing and executing Cargo commands.
 ///
@@ -31,20 +37,20 @@ use crate::{
 /// ```rust,no_run
 /// use ostool::build::cargo_builder::CargoBuilder;
 /// use ostool::build::config::Cargo;
-/// use ostool::ctx::AppContext;
+/// use ostool::Tool;
 ///
-/// // CargoBuilder is typically used internally by AppContext
-/// // See AppContext::cargo_build() and AppContext::cargo_run()
+/// // CargoBuilder is typically used internally by Tool
+/// // See Tool::cargo_build() and Tool::cargo_run()
 /// ```
 pub struct CargoBuilder<'a> {
-    ctx: &'a mut AppContext,
+    tool: &'a mut Tool,
     config: &'a Cargo,
     command: String,
     extra_args: Vec<String>,
     extra_envs: HashMap<String, String>,
     skip_objcopy: bool,
     resolve_artifact_from_json: bool,
-    resolved_elf_path: Option<PathBuf>,
+    resolved_artifact: Option<ResolvedCargoArtifact>,
     config_path: Option<PathBuf>,
 }
 
@@ -53,19 +59,19 @@ impl<'a> CargoBuilder<'a> {
     ///
     /// # Arguments
     ///
-    /// * `ctx` - The application context.
+    /// * `tool` - The tool context.
     /// * `config` - The Cargo build configuration.
     /// * `config_path` - Optional path to the configuration file.
-    pub fn build(ctx: &'a mut AppContext, config: &'a Cargo, config_path: Option<PathBuf>) -> Self {
+    pub fn build(tool: &'a mut Tool, config: &'a Cargo, config_path: Option<PathBuf>) -> Self {
         Self {
-            ctx,
+            tool,
             config,
             command: "build".to_string(),
             extra_args: Vec::new(),
             extra_envs: HashMap::new(),
             skip_objcopy: false,
-            resolve_artifact_from_json: false,
-            resolved_elf_path: None,
+            resolve_artifact_from_json: true,
+            resolved_artifact: None,
             config_path,
         }
     }
@@ -74,19 +80,19 @@ impl<'a> CargoBuilder<'a> {
     ///
     /// # Arguments
     ///
-    /// * `ctx` - The application context.
+    /// * `tool` - The tool context.
     /// * `config` - The Cargo build configuration.
     /// * `config_path` - Optional path to the configuration file.
-    pub fn run(ctx: &'a mut AppContext, config: &'a Cargo, config_path: Option<PathBuf>) -> Self {
+    pub fn run(tool: &'a mut Tool, config: &'a Cargo, config_path: Option<PathBuf>) -> Self {
         Self {
-            ctx,
+            tool,
             config,
             command: "run".to_string(),
             extra_args: Vec::new(),
             extra_envs: HashMap::new(),
             skip_objcopy: true,
-            resolve_artifact_from_json: false,
-            resolved_elf_path: None,
+            resolve_artifact_from_json: true,
+            resolved_artifact: None,
             config_path,
         }
     }
@@ -100,20 +106,20 @@ impl<'a> CargoBuilder<'a> {
     ///
     /// When enabled, builds in debug mode and enables GDB server for QEMU.
     pub fn debug(self, debug: bool) -> Self {
-        self.ctx.debug = debug;
+        self.tool.config.debug = debug;
         self
     }
 
     /// Creates a build command using the context's stored config path.
-    pub fn build_auto(ctx: &'a mut AppContext, config: &'a Cargo) -> Self {
-        let config_path = ctx.build_config_path.clone();
-        Self::build(ctx, config, config_path)
+    pub fn build_auto(tool: &'a mut Tool, config: &'a Cargo) -> Self {
+        let config_path = tool.ctx.build_config_path.clone();
+        Self::build(tool, config, config_path)
     }
 
     /// Creates a run command using the context's stored config path.
-    pub fn run_auto(ctx: &'a mut AppContext, config: &'a Cargo) -> Self {
-        let config_path = ctx.build_config_path.clone();
-        Self::run(ctx, config, config_path)
+    pub fn run_auto(tool: &'a mut Tool, config: &'a Cargo) -> Self {
+        let config_path = tool.ctx.build_config_path.clone();
+        Self::run(tool, config, config_path)
     }
 
     /// Adds a single argument to the Cargo command.
@@ -176,19 +182,13 @@ impl<'a> CargoBuilder<'a> {
 
     fn run_pre_build_cmds(&mut self) -> anyhow::Result<()> {
         for cmd in &self.config.pre_build_cmds {
-            self.ctx.shell_run_cmd(cmd)?;
+            self.tool.shell_run_cmd(cmd)?;
         }
         Ok(())
     }
 
     async fn run_cargo(&mut self) -> anyhow::Result<()> {
-        if self.resolve_artifact_from_json {
-            return self.run_cargo_and_resolve_artifact().await;
-        }
-
-        let mut cmd = self.build_cargo_command().await?;
-        cmd.run()?;
-        Ok(())
+        self.run_cargo_and_resolve_artifact().await
     }
 
     async fn run_cargo_and_resolve_artifact(&mut self) -> anyhow::Result<()> {
@@ -209,7 +209,7 @@ impl<'a> CargoBuilder<'a> {
             .ok_or_else(|| anyhow!("failed to capture cargo stdout for message parsing"))?;
         let reader = BufReader::new(stdout);
 
-        let mut executable_artifacts: Vec<(String, PathBuf)> = Vec::new();
+        let mut executable_artifacts: Vec<(String, ResolvedCargoArtifact)> = Vec::new();
         for message in Message::parse_stream(reader) {
             let message = message.context("failed to parse cargo JSON message stream")?;
             match message {
@@ -218,8 +218,23 @@ impl<'a> CargoBuilder<'a> {
                         && artifact.target.is_bin()
                         && let Some(executable) = artifact.executable
                     {
-                        executable_artifacts
-                            .push((artifact.target.name, executable.into_std_path_buf()));
+                        let elf_path = executable.into_std_path_buf();
+                        let cargo_artifact_dir = elf_path
+                            .parent()
+                            .ok_or_else(|| {
+                                anyhow!(
+                                    "cargo reported executable without parent directory: {}",
+                                    elf_path.display()
+                                )
+                            })?
+                            .to_path_buf();
+                        executable_artifacts.push((
+                            artifact.target.name,
+                            ResolvedCargoArtifact {
+                                elf_path,
+                                cargo_artifact_dir,
+                            },
+                        ));
                     }
                 }
                 Message::CompilerMessage(msg) => {
@@ -244,18 +259,18 @@ impl<'a> CargoBuilder<'a> {
         let resolved = self.pick_executable_artifact(&executable_artifacts, default_run.as_deref());
         let Some(resolved) = resolved else {
             bail!(
-                "no executable artifact found for package '{}' and target '{}'; please check system.Cargo.package/system.Cargo.target",
+                "no executable bin artifact found in cargo JSON output for package '{}' and target '{}'; ostool currently resolves only Cargo bin targets. Please check system.Cargo.package/system.Cargo.target",
                 self.config.package,
                 self.config.target
             );
         };
 
-        self.resolved_elf_path = Some(resolved);
+        self.resolved_artifact = Some(resolved);
         Ok(())
     }
 
     async fn build_cargo_command(&mut self) -> anyhow::Result<Command> {
-        let mut cmd = self.ctx.command("cargo");
+        let mut cmd = self.tool.command("cargo");
 
         cmd.arg(&self.command);
 
@@ -282,10 +297,8 @@ impl<'a> CargoBuilder<'a> {
         cmd.arg("-Z");
         cmd.arg("unstable-options");
 
-        if let Some(build_dir) = &self.ctx.paths.config.build_dir {
-            cmd.arg("--target-dir");
-            cmd.arg(build_dir.display().to_string());
-        }
+        cmd.arg("--target-dir");
+        cmd.arg(self.tool.build_dir().display().to_string());
 
         // Features
         let features = self.build_features();
@@ -300,7 +313,7 @@ impl<'a> CargoBuilder<'a> {
         }
 
         // Auto-detected args from someboot/build-info.toml
-        let workspace_manifest = self.ctx.paths.workspace.join("Cargo.toml");
+        let workspace_manifest = self.tool.workspace_dir().join("Cargo.toml");
         if workspace_manifest.exists() {
             let detected_args = someboot::detect_build_config_for_package(
                 &workspace_manifest,
@@ -320,21 +333,19 @@ impl<'a> CargoBuilder<'a> {
         }
 
         // Release mode
-        if !self.ctx.debug {
+        if !self.tool.debug_enabled() {
             cmd.arg("--release");
         }
 
-        if self.resolve_artifact_from_json {
-            cmd.arg("--message-format");
-            cmd.arg("json-render-diagnostics");
-        }
+        cmd.arg("--message-format");
+        cmd.arg("json-render-diagnostics");
 
         // Extra args
         for arg in &self.extra_args {
             cmd.arg(arg);
         }
 
-        if self.is_run() && self.ctx.debug {
+        if self.is_run() && self.tool.debug_enabled() {
             cmd.arg("--debug");
         }
 
@@ -342,21 +353,20 @@ impl<'a> CargoBuilder<'a> {
     }
 
     async fn handle_output(&mut self) -> anyhow::Result<()> {
-        let elf_path = if let Some(path) = &self.resolved_elf_path {
-            path.clone()
-        } else {
-            let target_dir = self.ctx.paths.build_dir();
+        let resolved = self.resolved_artifact.clone().ok_or_else(|| {
+            anyhow!(
+                "cargo build finished without a resolved executable artifact for package '{}' and target '{}'",
+                self.config.package,
+                self.config.target
+            )
+        })?;
 
-            target_dir
-                .join(&self.config.target)
-                .join(if self.ctx.debug { "debug" } else { "release" })
-                .join(&self.config.package)
-        };
-
-        self.ctx.set_elf_path(elf_path).await?;
+        self.tool.set_elf_artifact_path(resolved.elf_path).await?;
+        self.tool.ctx.artifacts.cargo_artifact_dir = Some(resolved.cargo_artifact_dir.clone());
+        self.tool.ctx.artifacts.runtime_artifact_dir = Some(resolved.cargo_artifact_dir);
 
         if self.config.to_bin && !self.skip_objcopy {
-            self.ctx.objcopy_output_bin()?;
+            self.tool.objcopy_output_bin()?;
         }
 
         Ok(())
@@ -364,13 +374,13 @@ impl<'a> CargoBuilder<'a> {
 
     fn run_post_build_cmds(&mut self) -> anyhow::Result<()> {
         for cmd in &self.config.post_build_cmds {
-            self.ctx.shell_run_cmd(cmd)?;
+            self.tool.shell_run_cmd(cmd)?;
         }
         Ok(())
     }
 
     fn target_package_info(&self) -> anyhow::Result<(PackageId, Option<String>)> {
-        let metadata = self.ctx.metadata()?;
+        let metadata = self.tool.metadata()?;
         let Some(package) = metadata
             .packages
             .iter()
@@ -379,7 +389,7 @@ impl<'a> CargoBuilder<'a> {
             bail!(
                 "package '{}' not found in cargo metadata under {}",
                 self.config.package,
-                self.ctx.paths.manifest.display()
+                self.tool.manifest_dir().display()
             );
         };
         Ok((package.id.clone(), package.default_run.clone()))
@@ -387,9 +397,9 @@ impl<'a> CargoBuilder<'a> {
 
     fn pick_executable_artifact(
         &self,
-        executable_artifacts: &[(String, PathBuf)],
+        executable_artifacts: &[(String, ResolvedCargoArtifact)],
         default_run: Option<&str>,
-    ) -> Option<PathBuf> {
+    ) -> Option<ResolvedCargoArtifact> {
         executable_artifacts
             .iter()
             .rev()
@@ -417,7 +427,7 @@ impl<'a> CargoBuilder<'a> {
     fn log_level_feature(&self) -> Option<String> {
         let level = self.config.log.clone()?;
 
-        let meta = self.ctx.metadata().ok()?;
+        let meta = self.tool.metadata().ok()?;
         let pkg = meta
             .packages
             .iter()
@@ -428,7 +438,11 @@ impl<'a> CargoBuilder<'a> {
         if has_log {
             Some(format!(
                 "log/{}max_level_{}",
-                if self.ctx.debug { "" } else { "release_" },
+                if self.tool.debug_enabled() {
+                    ""
+                } else {
+                    "release_"
+                },
                 format!("{:?}", level).to_lowercase()
             ))
         } else {

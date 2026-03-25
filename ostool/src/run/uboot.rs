@@ -1,4 +1,5 @@
 use std::{
+    io::{self, Write},
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
     thread,
@@ -18,9 +19,12 @@ use tokio::fs;
 use uboot_shell::UbootShell;
 
 use crate::{
-    ctx::AppContext,
+    Tool,
     run::{
-        output_matcher::{ByteStreamMatcher, MATCH_DRAIN_DURATION, StreamMatchKind},
+        output_matcher::{
+            ByteStreamMatcher, MATCH_DRAIN_DURATION, compile_regexes, print_match_event,
+        },
+        shell_init::{ShellAutoInitMatcher, normalize_shell_init_config, spawn_delayed_send},
         tftp,
     },
     sterm::SerialTerm,
@@ -60,6 +64,12 @@ pub struct UbootConfig {
     pub success_regex: Vec<String>,
     pub fail_regex: Vec<String>,
     pub uboot_cmd: Option<Vec<String>>,
+    /// String prefix that indicates the target shell is ready after boot.
+    pub shell_prefix: Option<String>,
+    /// Command sent once after `shell_prefix` is detected.
+    pub shell_init_cmd: Option<String>,
+    /// Timeout in seconds after entering kernel output. `None` or `0` disables the timeout.
+    pub timeout: Option<u64>,
 }
 
 impl UbootConfig {
@@ -80,6 +90,18 @@ impl UbootConfig {
             }
         })
     }
+
+    fn normalize(&mut self, config_name: &str) -> anyhow::Result<()> {
+        normalize_shell_init_config(
+            &mut self.shell_prefix,
+            &mut self.shell_init_cmd,
+            config_name,
+        )
+    }
+
+    fn shell_auto_init(&self) -> Option<ShellAutoInitMatcher> {
+        ShellAutoInitMatcher::new(self.shell_prefix.clone(), self.shell_init_cmd.clone())
+    }
 }
 
 #[derive(Default, Serialize, Deserialize, JsonSchema, Debug, Clone)]
@@ -88,6 +110,8 @@ pub struct Net {
     pub board_ip: Option<String>,
     pub gatewayip: Option<String>,
     pub netmask: Option<String>,
+    /// Use an existing TFTP root directory directly. On Linux this skips all
+    /// tftpd-hpa detection, installation, config, and service checks.
     pub tftp_dir: Option<String>,
 }
 
@@ -97,73 +121,95 @@ pub struct RunUbootArgs {
     pub show_output: bool,
 }
 
-pub async fn run_uboot(ctx: AppContext, args: RunUbootArgs) -> anyhow::Result<()> {
-    // Build logic will be implemented here
-    let config_path = match args.config.clone() {
-        Some(path) => path,
-        None => ctx.paths.workspace.join(".uboot.toml"),
-    };
-
-    let config = if config_path.exists() {
-        println!("Using U-Boot config: {}", config_path.display());
-        let mut config_content = fs::read_to_string(&config_path)
-            .await
-            .with_path("failed to read file", &config_path)?;
-
-        config_content = replace_env_placeholders(&config_content)?;
-
-        let config: UbootConfig = toml::from_str(&config_content)
-            .with_context(|| format!("failed to parse U-Boot config: {}", config_path.display()))?;
-        config
-    } else {
-        let config = UbootConfig {
-            serial: "/dev/ttyUSB0".to_string(),
-            baud_rate: "115200".into(),
-            ..Default::default()
+impl Tool {
+    pub async fn run_uboot(&mut self, args: RunUbootArgs) -> anyhow::Result<()> {
+        let config_path = match args.config.clone() {
+            Some(path) => path,
+            None => self.workspace_dir().join(".uboot.toml"),
         };
 
-        fs::write(&config_path, toml::to_string_pretty(&config)?)
-            .await
-            .with_path("failed to write file", &config_path)?;
-        config
-    };
+        let config = match fs::read_to_string(&config_path).await {
+            Ok(content) => {
+                println!("Using U-Boot config: {}", config_path.display());
+                let config_content = replace_env_placeholders(&content)?;
+                let mut config: UbootConfig =
+                    toml::from_str(&config_content).with_context(|| {
+                        format!("failed to parse U-Boot config: {}", config_path.display())
+                    })?;
+                config.normalize(&format!("U-Boot config {}", config_path.display()))?;
+                config
+            }
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                let mut config = UbootConfig {
+                    serial: "/dev/ttyUSB0".to_string(),
+                    baud_rate: "115200".into(),
+                    ..Default::default()
+                };
+                config.normalize(&format!("U-Boot config {}", config_path.display()))?;
+                fs::write(&config_path, toml::to_string_pretty(&config)?)
+                    .await
+                    .with_path("failed to write file", &config_path)?;
+                config
+            }
+            Err(e) => return Err(e.into()),
+        };
 
-    let baud_rate = config.baud_rate.parse::<u32>().with_context(|| {
-        format!(
-            "baud_rate is not a valid integer in {}",
-            config_path.display()
-        )
-    })?;
+        let baud_rate = config.baud_rate.parse::<u32>().with_context(|| {
+            format!(
+                "baud_rate is not a valid integer in {}",
+                config_path.display()
+            )
+        })?;
 
-    let mut runner = Runner {
-        ctx,
-        config,
-        baud_rate,
-        success_regex: vec![],
-        fail_regex: vec![],
-    };
-    runner.run().await?;
-    Ok(())
+        let mut runner = Runner {
+            tool: self,
+            config,
+            baud_rate,
+            success_regex: vec![],
+            fail_regex: vec![],
+        };
+        runner.run().await?;
+        Ok(())
+    }
 }
 
-struct Runner {
-    ctx: AppContext,
+struct Runner<'a> {
+    tool: &'a mut Tool,
     config: UbootConfig,
     success_regex: Vec<regex::Regex>,
     fail_regex: Vec<regex::Regex>,
     baud_rate: u32,
 }
 
-impl Runner {
-    /// 生成压缩的 FIT image 包含 kernel 和 FDT
-    ///
-    /// # 参数
-    /// - `kernel_path`: kernel 文件路径
-    /// - `dtb_path`: DTB 文件路径（可选）
-    /// - `kernel_load_addr`: kernel 加载地址
-    ///
-    /// # 返回值
-    /// 返回生成的 FIT image 文件路径
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct NetworkBootRequest {
+    bootfile: String,
+    bootcmd: String,
+    ipaddr: Option<String>,
+}
+
+struct SharedWrite {
+    inner: Arc<Mutex<Box<dyn Write + Send>>>,
+}
+
+impl SharedWrite {
+    fn new(inner: Arc<Mutex<Box<dyn Write + Send>>>) -> Self {
+        Self { inner }
+    }
+}
+
+impl Write for SharedWrite {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.inner.lock().unwrap().write(buf)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.lock().unwrap().flush()
+    }
+}
+
+impl Runner<'_> {
+    /// 生成包含 kernel 和 FDT 的压缩 FIT image。
     async fn generate_fit_image(
         &self,
         kernel_path: &Path,
@@ -191,14 +237,13 @@ impl Runner {
             Byte::from(kernel_data.len())
         );
 
-        let arch = match self.ctx.arch.as_ref().unwrap() {
+        let arch = match self.tool.ctx.arch.as_ref().unwrap() {
             object::Architecture::Aarch64 => "arm64",
             object::Architecture::Arm => "arm",
             object::Architecture::LoongArch64 => "loongarch64",
             _ => todo!(),
         };
 
-        // 创建配置，与 test.its 文件中的参数一致
         let mut config = FitImageConfig::new("Various kernels, ramdisks and FDT blobs")
             .with_kernel(
                 ComponentConfig::new("kernel", kernel_data)
@@ -224,7 +269,7 @@ impl Runner {
             );
             fdt_name = Some("fdt");
 
-            // Can not compress DTB, U-Boot will not accept it
+            // U-Boot 不接受压缩的 DTB
             let mut fdt_config = ComponentConfig::new("fdt", data.clone())
                 .with_description("This fdt")
                 .with_type("flat_dt")
@@ -249,13 +294,10 @@ impl Runner {
                 None::<String>,
             );
 
-        // 使用新的 mkimage API 构建 FIT image
         let mut builder = FitImageBuilder::new();
         let fit_data = builder
             .build(config)
             .with_context(|| errors::FIT_BUILD_ERROR.to_string())?;
-
-        // 保存到文件
         let output_path = Path::new(output_dir).join("image.fit");
         fs::write(&output_path, fit_data)
             .await
@@ -270,19 +312,19 @@ impl Runner {
         if let Some(ref cmd) = self.config.board_power_off_cmd
             && !cmd.trim().is_empty()
         {
-            let _ = self.ctx.shell_run_cmd(cmd);
+            let _ = self.tool.shell_run_cmd(cmd);
             info!("Board powered off");
         }
         res
     }
 
     async fn _run(&mut self) -> anyhow::Result<()> {
-        self.preper_regex()?;
-        self.ctx.objcopy_output_bin()?;
+        self.prepare_regex()?;
+        self.tool.objcopy_output_bin()?;
 
         let kernel = self
+            .tool
             .ctx
-            .paths
             .artifacts
             .bin
             .as_ref()
@@ -298,12 +340,48 @@ impl Runner {
             .config
             .net
             .as_ref()
-            .and_then(|net| net.tftp_dir.as_ref())
-            .is_some();
+            .and_then(|net| net.tftp_dir.as_deref())
+            .map(str::trim)
+            .filter(|path| !path.is_empty())
+            .map(PathBuf::from);
 
-        if !is_tftp && let Some(ip) = ip_string.as_ref() {
+        #[cfg(target_os = "linux")]
+        let linux_system_tftp = if let Some(directory) = is_tftp.clone() {
+            info!(
+                "Linux detected: using net.tftp_dir={} and skipping all tftpd-hpa checks",
+                directory.display()
+            );
+            Some(tftp::TftpdHpaConfig {
+                username: None,
+                directory,
+                address: None,
+                options: None,
+            })
+        } else if self.config.net.is_some() && ip_string.is_some() {
+            Some(tftp::ensure_linux_tftpd_hpa()?)
+        } else {
+            None
+        };
+
+        let mut builtin_tftp_started = false;
+
+        #[cfg(not(target_os = "linux"))]
+        if is_tftp.is_none()
+            && let Some(ip) = ip_string.as_ref()
+        {
             info!("TFTP server IP: {}", ip);
-            tftp::run_tftp_server(&self.ctx)?;
+            tftp::run_tftp_server(self.tool)?;
+            builtin_tftp_started = true;
+        }
+
+        #[cfg(target_os = "linux")]
+        if linux_system_tftp.is_none()
+            && is_tftp.is_none()
+            && let Some(ip) = ip_string.as_ref()
+        {
+            info!("TFTP server IP: {}", ip);
+            tftp::run_tftp_server(self.tool)?;
+            builtin_tftp_started = true;
         }
 
         info!(
@@ -328,7 +406,7 @@ impl Runner {
         if let Some(cmd) = self.config.board_reset_cmd.clone()
             && !cmd.trim().is_empty()
         {
-            self.ctx.shell_run_cmd(&cmd)?;
+            self.tool.shell_run_cmd(&cmd)?;
         }
 
         let mut net_ok = false;
@@ -429,55 +507,65 @@ impl Runner {
             )
             .await?;
 
-        let fitname = if is_tftp {
-            let tftp_dir = self
-                .config
-                .net
-                .as_ref()
-                .and_then(|net| net.tftp_dir.as_ref())
-                .unwrap();
-
+        let (fitname, linux_tftp_active) = if cfg!(target_os = "linux") {
+            if let Some(system_tftp) = linux_system_tftp.as_ref() {
+                let prepared = tftp::stage_linux_fit_image(&fitimage, &system_tftp.directory)?;
+                info!(
+                    "Staged FIT image to: {}",
+                    prepared.absolute_fit_path.display()
+                );
+                (prepared.relative_filename, true)
+            } else if let Some(tftp_dir) = is_tftp.as_deref() {
+                let fitimage = fitimage.file_name().unwrap();
+                let tftp_path = PathBuf::from(tftp_dir).join(fitimage);
+                info!("Setting TFTP file path: {}", tftp_path.display());
+                (tftp_path.display().to_string(), false)
+            } else {
+                let name = fitimage
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .ok_or(anyhow!("Invalid fitimage filename"))?;
+                info!("Using fitimage filename: {}", name);
+                (name.to_string(), false)
+            }
+        } else if let Some(tftp_dir) = is_tftp.as_deref() {
             let fitimage = fitimage.file_name().unwrap();
             let tftp_path = PathBuf::from(tftp_dir).join(fitimage);
-
             info!("Setting TFTP file path: {}", tftp_path.display());
-            tftp_path.display().to_string()
+            (tftp_path.display().to_string(), false)
         } else {
             let name = fitimage
                 .file_name()
                 .and_then(|n| n.to_str())
                 .ok_or(anyhow!("Invalid fitimage filename"))?;
-
             info!("Using fitimage filename: {}", name);
-            name.to_string()
+            (name.to_string(), false)
         };
 
-        let bootcmd =
-            if let Some(ref board_ip) = self.config.net.as_ref().and_then(|e| e.board_ip.clone()) {
+        let network_transfer_ready = linux_tftp_active || is_tftp.is_some() || builtin_tftp_started;
+
+        let bootcmd = if let Some(request) = build_network_boot_request(
+            self.config
+                .net
+                .as_ref()
+                .and_then(|net| net.board_ip.as_deref()),
+            net_ok,
+            network_transfer_ready,
+            &fitname,
+        ) {
+            if let Some(ref board_ip) = request.ipaddr {
                 uboot.set_env("ipaddr", board_ip)?;
-                format!("tftp {fitname} && bootm",)
-            } else if net_ok {
-                format!("dhcp {fitname} && bootm",)
-            } else {
-                info!("No TFTP config, using loady to upload FIT image...");
-                Self::uboot_loady(&mut uboot, fit_loadaddr as usize, fitimage);
-                "bootm".to_string()
-            };
+            }
+            uboot.set_env("bootfile", &request.bootfile)?;
+            request.bootcmd
+        } else {
+            info!("No TFTP config, using loady to upload FIT image...");
+            Self::uboot_loady(&mut uboot, fit_loadaddr as usize, fitimage);
+            "bootm".to_string()
+        };
 
         info!("Booting kernel with command: {}", bootcmd);
         uboot.cmd_without_reply(&bootcmd)?;
-        // if self.config.net.is_some() {
-        //     info!("TFTP upload FIT image to board...");
-        //     let filename = fitimage.file_name().unwrap().to_str().unwrap();
-
-        //     let tftp_cmd = format!("tftp {filename}");
-        //     uboot.cmd(&tftp_cmd)?;
-        //     uboot.cmd_without_reply("bootm")?;
-        // } else {
-        //     info!("No TFTP config, using loady to upload FIT image...");
-        //     Self::uboot_loady(&mut uboot, fit_loadaddr as usize, fitimage);
-        //     uboot.cmd_without_reply("bootm")?;
-        // }
 
         let tx = uboot.tx.take().unwrap();
         let rx = uboot.rx.take().unwrap();
@@ -494,47 +582,37 @@ impl Runner {
         let res = Arc::new(Mutex::<Option<anyhow::Result<()>>>::new(None));
         let res_clone = res.clone();
         let matcher_clone = matcher.clone();
-        let mut shell = SerialTerm::new_with_byte_callback(tx, rx, move |h, byte| {
-            let mut matcher = matcher_clone.lock().unwrap();
-            if let Some(matched) = matcher.observe_byte(byte) {
-                match matched.kind {
-                    StreamMatchKind::Success => {
-                        println!(
-                            "{}",
-                            format!(
-                                "\r\n=== SUCCESS PATTERN MATCHED: {} ===",
-                                matched.matched_regex
-                            )
-                            .green()
-                        );
-                        let mut res_lock = res_clone.lock().unwrap();
-                        *res_lock = Some(Ok(()));
-                    }
-                    StreamMatchKind::Fail => {
-                        println!(
-                            "{}",
-                            format!(
-                                "\r\n=== FAIL PATTERN MATCHED: {} ===",
-                                matched.matched_regex
-                            )
-                            .red()
-                        );
-                        let mut res_lock = res_clone.lock().unwrap();
-                        *res_lock = Some(Err(anyhow!(
-                            "Fail pattern matched '{}': {}",
-                            matched.matched_regex,
-                            matched.matched_text.trim_end()
-                        )));
-                    }
+        let shared_tx = Arc::new(Mutex::new(tx));
+        let shell_init = Arc::new(Mutex::new(self.config.shell_auto_init()));
+        let shell_init_clone = shell_init.clone();
+        let shared_tx_clone = shared_tx.clone();
+        let mut shell = SerialTerm::new_with_byte_callback(
+            Box::new(SharedWrite::new(shared_tx)),
+            rx,
+            move |h, byte| {
+                let mut matcher = matcher_clone.lock().unwrap();
+                if let Some(matched) = matcher.observe_byte(byte) {
+                    print_match_event(&matched);
+                    let mut res_lock = res_clone.lock().unwrap();
+                    *res_lock = Some(matched.kind.into_result(&matched));
+                    h.stop_after(MATCH_DRAIN_DURATION);
                 }
 
-                h.stop_after(MATCH_DRAIN_DURATION);
-            }
+                let mut shell_init = shell_init_clone.lock().unwrap();
+                if let Some(shell_init) = shell_init.as_mut()
+                    && let Some(command) = shell_init.observe_byte(byte)
+                {
+                    spawn_delayed_send(shared_tx_clone.clone(), command);
+                }
 
-            if matcher.should_stop() {
-                h.stop();
-            }
-        });
+                if matcher.should_stop() {
+                    h.stop();
+                }
+            },
+        );
+        if let Some(timeout) = timeout_duration(self.config.timeout) {
+            shell = shell.with_timeout(timeout, "kernel boot");
+        }
         shell.run().await?;
         {
             let mut res_lock = res.lock().unwrap();
@@ -545,23 +623,10 @@ impl Runner {
         Ok(())
     }
 
-    fn preper_regex(&mut self) -> anyhow::Result<()> {
-        // Prepare regex patterns if needed
-        // Compile success regex patterns
-        for pattern in self.config.success_regex.iter() {
-            // Compile and store the regex
-            let regex =
-                regex::Regex::new(pattern).map_err(|e| anyhow!("success regex error: {e}"))?;
-            self.success_regex.push(regex);
-        }
-
-        // Compile fail regex patterns
-        for pattern in self.config.fail_regex.iter() {
-            // Compile and store the regex
-            let regex = regex::Regex::new(pattern).map_err(|e| anyhow!("fail regex error: {e}"))?;
-            self.fail_regex.push(regex);
-        }
-
+    fn prepare_regex(&mut self) -> anyhow::Result<()> {
+        let (success, fail) = compile_regexes(&self.config.success_regex, &self.config.fail_regex)?;
+        self.success_regex = success;
+        self.fail_regex = fail;
         Ok(())
     }
 
@@ -612,5 +677,133 @@ impl Runner {
 
         println!("{}", res);
         println!("send ok");
+    }
+}
+
+fn timeout_duration(timeout: Option<u64>) -> Option<Duration> {
+    match timeout {
+        Some(0) | None => None,
+        Some(secs) => Some(Duration::from_secs(secs)),
+    }
+}
+
+fn build_network_boot_request(
+    board_ip: Option<&str>,
+    net_ok: bool,
+    network_transfer_ready: bool,
+    fitname: &str,
+) -> Option<NetworkBootRequest> {
+    if !network_transfer_ready {
+        return None;
+    }
+
+    if let Some(board_ip) = board_ip {
+        return Some(NetworkBootRequest {
+            bootfile: fitname.to_string(),
+            bootcmd: format!("tftp {fitname} && bootm"),
+            ipaddr: Some(board_ip.to_string()),
+        });
+    }
+
+    if net_ok {
+        return Some(NetworkBootRequest {
+            bootfile: fitname.to_string(),
+            bootcmd: format!("dhcp {fitname} && bootm"),
+            ipaddr: None,
+        });
+    }
+
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{UbootConfig, build_network_boot_request, timeout_duration};
+    use std::time::Duration;
+
+    #[test]
+    fn network_boot_request_uses_same_filename_for_bootfile() {
+        let request = build_network_boot_request(
+            Some("192.168.1.10"),
+            false,
+            true,
+            "ostool/home/user/workspace/target/image.fit",
+        )
+        .unwrap();
+
+        assert_eq!(
+            request.bootfile,
+            "ostool/home/user/workspace/target/image.fit"
+        );
+        assert_eq!(
+            request.bootcmd,
+            "tftp ostool/home/user/workspace/target/image.fit && bootm"
+        );
+    }
+
+    #[test]
+    fn network_boot_request_requires_ready_transport() {
+        assert!(
+            build_network_boot_request(Some("192.168.1.10"), false, false, "image.fit").is_none()
+        );
+        assert!(build_network_boot_request(None, false, true, "image.fit").is_none());
+        assert_eq!(
+            build_network_boot_request(None, true, true, "image.fit")
+                .unwrap()
+                .bootcmd,
+            "dhcp image.fit && bootm"
+        );
+    }
+
+    #[test]
+    fn uboot_config_normalize_rejects_shell_init_without_prefix() {
+        let mut config = UbootConfig {
+            serial: "/dev/null".into(),
+            baud_rate: "115200".into(),
+            shell_init_cmd: Some("root".into()),
+            ..Default::default()
+        };
+
+        let err = config.normalize("test config").unwrap_err();
+        assert!(err.to_string().contains("shell_prefix"));
+    }
+
+    #[test]
+    fn uboot_config_normalize_trims_shell_fields() {
+        let mut config = UbootConfig {
+            serial: "/dev/null".into(),
+            baud_rate: "115200".into(),
+            shell_prefix: Some(" login: ".into()),
+            shell_init_cmd: Some(" root ".into()),
+            ..Default::default()
+        };
+
+        config.normalize("test config").unwrap();
+
+        assert_eq!(config.shell_prefix.as_deref(), Some("login:"));
+        assert_eq!(config.shell_init_cmd.as_deref(), Some("root"));
+    }
+
+    #[test]
+    fn uboot_timeout_zero_disables_timeout() {
+        assert_eq!(timeout_duration(None), None);
+        assert_eq!(timeout_duration(Some(0)), None);
+        assert_eq!(timeout_duration(Some(5)), Some(Duration::from_secs(5)));
+    }
+
+    #[test]
+    fn uboot_config_parses_timeout_from_toml() {
+        let config: UbootConfig = toml::from_str(
+            r#"
+serial = "/dev/null"
+baud_rate = "115200"
+success_regex = []
+fail_regex = []
+timeout = 0
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(config.timeout, Some(0));
     }
 }

@@ -22,29 +22,33 @@
 
 use std::{
     ffi::OsString,
-    io::{self, BufReader, ErrorKind, Read, Write},
+    io::{self, BufReader, ErrorKind, IsTerminal, Read, Write},
     path::Path,
     path::PathBuf,
     process::{Child, Stdio},
-    sync::mpsc,
+    sync::{Arc, Mutex, mpsc},
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context, anyhow};
+#[cfg(windows)]
 use colored::Colorize;
-use crossterm::terminal::disable_raw_mode;
+use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
+use log::warn;
 use object::Architecture;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use tokio::fs;
 
 use crate::{
-    ctx::AppContext,
+    Tool,
     run::{
-        output_matcher::{ByteStreamMatcher, StreamMatch, StreamMatchKind},
+        output_matcher::{ByteStreamMatcher, compile_regexes, print_match_event},
         ovmf_prebuilt::{Arch, FileType, Prebuilt, Source},
+        shell_init::{ShellAutoInitMatcher, normalize_shell_init_config, spawn_delayed_send},
     },
+    sterm::restore_terminal_mode,
     utils::PathResultExt,
 };
 
@@ -71,6 +75,26 @@ pub struct QemuConfig {
     pub success_regex: Vec<String>,
     /// Regex patterns that indicate failed execution.
     pub fail_regex: Vec<String>,
+    /// String prefix that indicates the guest shell is ready.
+    pub shell_prefix: Option<String>,
+    /// Command sent once after `shell_prefix` is detected.
+    pub shell_init_cmd: Option<String>,
+    /// Timeout in seconds. `None` or `0` disables the timeout.
+    pub timeout: Option<u64>,
+}
+
+impl QemuConfig {
+    fn normalize(&mut self, config_name: &str) -> anyhow::Result<()> {
+        normalize_shell_init_config(
+            &mut self.shell_prefix,
+            &mut self.shell_init_cmd,
+            config_name,
+        )
+    }
+
+    fn shell_auto_init(&self) -> Option<ShellAutoInitMatcher> {
+        ShellAutoInitMatcher::new(self.shell_prefix.clone(), self.shell_init_cmd.clone())
+    }
 }
 
 /// Arguments for running QEMU.
@@ -86,6 +110,7 @@ pub struct RunQemuArgs {
 
 #[derive(Debug, Clone, Default)]
 struct QemuDefaultOverrides {
+    to_bin: Option<bool>,
     args: Vec<String>,
     success_regex: Vec<String>,
     fail_regex: Vec<String>,
@@ -98,67 +123,77 @@ struct QemuDefaultOverrides {
 ///
 /// # Arguments
 ///
-/// * `ctx` - The application context containing paths and build artifacts.
+/// * `tool` - The tool containing paths and build artifacts.
 /// * `args` - QEMU run arguments.
 ///
 /// # Errors
 ///
 /// Returns an error if QEMU fails to start or exits with an error.
-pub async fn run_qemu(ctx: AppContext, args: RunQemuArgs) -> anyhow::Result<()> {
-    run_qemu_with_defaults(ctx, args, QemuDefaultOverrides::default()).await
-}
+impl Tool {
+    pub async fn run_qemu(&mut self, args: RunQemuArgs) -> anyhow::Result<()> {
+        self.run_qemu_with_more_default_args(args, None, vec![], vec![], vec![])
+            .await
+    }
 
-pub async fn run_qemu_with_more_default_args(
-    ctx: AppContext,
-    run_args: RunQemuArgs,
-    args: Vec<String>,
-    success_regex: Vec<String>,
-    fail_regex: Vec<String>,
-) -> anyhow::Result<()> {
-    run_qemu_with_defaults(
-        ctx,
-        run_args,
-        QemuDefaultOverrides {
-            args,
-            success_regex,
-            fail_regex,
-        },
-    )
-    .await
+    pub async fn run_qemu_with_more_default_args(
+        &mut self,
+        run_args: RunQemuArgs,
+        to_bin: Option<bool>,
+        args: Vec<String>,
+        success_regex: Vec<String>,
+        fail_regex: Vec<String>,
+    ) -> anyhow::Result<()> {
+        run_qemu_with_defaults(
+            self,
+            run_args,
+            QemuDefaultOverrides {
+                to_bin,
+                args,
+                success_regex,
+                fail_regex,
+            },
+        )
+        .await
+    }
 }
 
 async fn run_qemu_with_defaults(
-    ctx: AppContext,
+    tool: &mut Tool,
     run_args: RunQemuArgs,
     overrides: QemuDefaultOverrides,
 ) -> anyhow::Result<()> {
-    let config = load_or_create_qemu_config(&ctx, run_args.qemu_config.clone(), overrides).await?;
-    run_qemu_with_config(ctx, run_args, config).await
+    let config = load_or_create_qemu_config(tool, run_args.qemu_config.clone(), overrides).await?;
+    run_qemu_with_config(tool, run_args, config).await
 }
 
 async fn load_or_create_qemu_config(
-    ctx: &AppContext,
+    tool: &Tool,
     explicit_config_path: Option<PathBuf>,
     overrides: QemuDefaultOverrides,
 ) -> anyhow::Result<QemuConfig> {
-    let config_path = resolve_qemu_config_path(ctx, explicit_config_path)?;
+    let config_path = resolve_qemu_config_path(tool, explicit_config_path)?;
 
     info!("Using QEMU config file: {}", config_path.display());
 
-    if config_path.exists() {
-        let config_content = fs::read_to_string(&config_path)
-            .await
-            .with_path("failed to read file", &config_path)?;
-        let config: QemuConfig = toml::from_str(&config_content)
-            .with_context(|| format!("failed to parse QEMU config: {}", config_path.display()))?;
-        return Ok(config);
-    }
-
-    let config = build_default_qemu_config(ctx.arch, overrides);
-    fs::write(&config_path, toml::to_string_pretty(&config)?)
-        .await
-        .with_path("failed to write file", &config_path)?;
-    Ok(config)
+    let config_content = match fs::read_to_string(&config_path).await {
+        Ok(content) => {
+            let mut config: QemuConfig = toml::from_str(&content).with_context(|| {
+                format!("failed to parse QEMU config: {}", config_path.display())
+            })?;
+            config.normalize(&format!("QEMU config {}", config_path.display()))?;
+            return Ok(config);
+        }
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            let mut config = build_default_qemu_config(tool.ctx.arch, overrides);
+            config.normalize(&format!("QEMU config {}", config_path.display()))?;
+            fs::write(&config_path, toml::to_string_pretty(&config)?)
+                .await
+                .with_path("failed to write file", &config_path)?;
+            config
+        }
+        Err(e) => return Err(e.into()),
+    };
+    Ok(config_content)
 }
 
 fn build_default_qemu_config(
@@ -166,7 +201,7 @@ fn build_default_qemu_config(
     overrides: QemuDefaultOverrides,
 ) -> QemuConfig {
     let mut config = QemuConfig {
-        to_bin: true,
+        to_bin: overrides.to_bin.unwrap_or(true),
         success_regex: overrides.success_regex,
         fail_regex: overrides.fail_regex,
         ..Default::default()
@@ -190,14 +225,13 @@ fn build_default_qemu_config(
 }
 
 async fn run_qemu_with_config(
-    ctx: AppContext,
+    tool: &mut Tool,
     run_args: RunQemuArgs,
     config: QemuConfig,
 ) -> anyhow::Result<()> {
     let mut runner = QemuRunner {
-        ctx,
+        tool,
         config,
-        args: vec![],
         dtbdump: run_args.dtb_dump,
         success_regex: vec![],
         fail_regex: vec![],
@@ -205,24 +239,44 @@ async fn run_qemu_with_config(
     runner.run().await
 }
 
-struct QemuRunner {
-    ctx: AppContext,
+struct QemuRunner<'a> {
+    tool: &'a mut Tool,
     config: QemuConfig,
-    args: Vec<String>,
     dtbdump: bool,
     success_regex: Vec<regex::Regex>,
     fail_regex: Vec<regex::Regex>,
 }
 
-impl QemuRunner {
+struct RawModeGuard {
+    enabled: bool,
+}
+
+impl RawModeGuard {
+    fn new() -> Self {
+        let enabled =
+            io::stdin().is_terminal() && io::stdout().is_terminal() && enable_raw_mode().is_ok();
+        Self { enabled }
+    }
+}
+
+impl Drop for RawModeGuard {
+    fn drop(&mut self) {
+        if self.enabled {
+            let _ = disable_raw_mode();
+            let _ = io::stdout().flush();
+        }
+    }
+}
+
+impl QemuRunner<'_> {
     async fn run(&mut self) -> anyhow::Result<()> {
-        self.preper_regex()?;
+        self.prepare_regex()?;
 
         if self.config.to_bin {
-            self.ctx.objcopy_output_bin()?;
+            self.tool.objcopy_output_bin()?;
         }
 
-        let detected_arch = self.ctx.arch.ok_or_else(|| {
+        let detected_arch = self.tool.ctx.arch.ok_or_else(|| {
             anyhow!("Please specify `arch` in QEMU config or provide a valid ELF file.")
         })?;
         let arch = format!("{detected_arch:?}").to_lowercase();
@@ -234,14 +288,6 @@ impl QemuRunner {
         .to_string();
 
         let mut need_machine = true;
-
-        for arg in &self.config.args {
-            if arg == "-machine" || arg == "-M" {
-                need_machine = false;
-            }
-
-            self.args.push(arg.clone());
-        }
 
         #[allow(unused_mut)]
         let mut qemu_executable = format!("qemu-system-{}", arch);
@@ -259,9 +305,12 @@ impl QemuRunner {
             }
         }
 
-        let mut cmd = self.ctx.command(&qemu_executable);
+        let mut cmd = self.tool.command(&qemu_executable);
 
         for arg in &self.config.args {
+            if arg == "-machine" || arg == "-M" {
+                need_machine = false;
+            }
             cmd.arg(arg);
         }
 
@@ -281,7 +330,7 @@ impl QemuRunner {
             cmd.arg("-machine").arg(machine);
         }
 
-        if self.ctx.debug {
+        if self.tool.debug_enabled() {
             cmd.arg("-s").arg("-S");
         }
 
@@ -309,19 +358,35 @@ impl QemuRunner {
         }
 
         if use_kernel_loader {
-            if let Some(bin_path) = &self.ctx.paths.artifacts.bin {
+            if let Some(bin_path) = &self.tool.ctx.artifacts.bin {
                 cmd.arg("-kernel").arg(bin_path);
-            } else if let Some(elf_path) = &self.ctx.paths.artifacts.elf {
+            } else if let Some(elf_path) = &self.tool.ctx.artifacts.elf {
                 cmd.arg("-kernel").arg(elf_path);
             }
         }
+        cmd.stdin(Stdio::piped());
         cmd.stdout(Stdio::piped());
         cmd.stderr(Stdio::piped());
         cmd.print_cmd();
         let mut child = cmd.spawn()?;
+        let stdin = child.stdin.take().map(|stdin| Arc::new(Mutex::new(stdin)));
+        let _raw_mode = RawModeGuard::new();
+        if let Some(stdin) = stdin.as_ref() {
+            Self::spawn_stdin_passthrough(stdin.clone());
+        }
         let mut matcher =
             ByteStreamMatcher::new(self.success_regex.clone(), self.fail_regex.clone());
-        Self::process_output_stream(&mut child, &mut matcher)?;
+        let mut shell_auto_init = self.config.shell_auto_init();
+        let timeout = timeout_duration(self.config.timeout);
+        let start = Instant::now();
+        Self::process_output_stream(
+            &mut child,
+            &mut matcher,
+            &mut shell_auto_init,
+            stdin,
+            timeout,
+            start,
+        )?;
 
         let out = child.wait_with_output()?;
         if let Some(res) = matcher.final_result() {
@@ -343,7 +408,7 @@ impl QemuRunner {
         }
 
         let arch =
-            self.ctx.arch.as_ref().ok_or_else(|| {
+            self.tool.ctx.arch.as_ref().ok_or_else(|| {
                 anyhow::anyhow!("Cannot determine architecture for OVMF preparation")
             })?;
         let tmp = std::env::temp_dir();
@@ -378,8 +443,8 @@ impl QemuRunner {
 
     async fn prepare_uefi_esp(&self, arch: Arch) -> anyhow::Result<PathBuf> {
         let bin_path = self
+            .tool
             .ctx
-            .paths
             .artifacts
             .bin
             .as_ref()
@@ -407,35 +472,23 @@ impl QemuRunner {
     }
 
     fn uefi_artifact_dir(&self, bin_path: &Path) -> anyhow::Result<PathBuf> {
-        let metadata = self.ctx.metadata()?;
-        let target_dir = metadata.target_directory.into_std_path_buf();
-        let target_dir = target_dir.canonicalize().unwrap_or(target_dir);
+        if let Some(dir) = &self.tool.ctx.artifacts.runtime_artifact_dir {
+            return Ok(dir.clone());
+        }
+
         let bin_path = bin_path
             .canonicalize()
             .with_path("failed to canonicalize file", bin_path)?;
-        let artifact_dir = match bin_path.strip_prefix(&target_dir) {
-            Ok(relative_bin_path) => {
-                let artifact_parent = relative_bin_path.parent().ok_or_else(|| {
-                    anyhow!(
-                        "invalid BIN path under target directory: {}",
-                        bin_path.display()
-                    )
-                })?;
-                target_dir.join(artifact_parent)
-            }
-            Err(_) => bin_path
-                .parent()
-                .ok_or_else(|| anyhow!("invalid BIN path: {}", bin_path.display()))?
-                .to_path_buf(),
-        };
-
-        Ok(artifact_dir)
+        bin_path
+            .parent()
+            .map(PathBuf::from)
+            .ok_or_else(|| anyhow!("invalid BIN path: {}", bin_path.display()))
     }
 
     async fn prepare_uefi_vars(&self, vars_template: &Path) -> anyhow::Result<PathBuf> {
         let bin_path = self
+            .tool
             .ctx
-            .paths
             .artifacts
             .bin
             .as_ref()
@@ -473,6 +526,10 @@ impl QemuRunner {
     fn process_output_stream(
         child: &mut Child,
         matcher: &mut ByteStreamMatcher,
+        shell_auto_init: &mut Option<ShellAutoInitMatcher>,
+        stdin: Option<Arc<Mutex<std::process::ChildStdin>>>,
+        timeout: Option<Duration>,
+        start: Instant,
     ) -> anyhow::Result<()> {
         let stdout = child
             .stdout
@@ -506,7 +563,14 @@ impl QemuRunner {
                     let _ = std::io::stdout().flush();
 
                     if let Some(matched) = matcher.observe_byte(byte) {
-                        Self::print_match_event(&matched);
+                        print_match_event(&matched);
+                    }
+
+                    if let Some(shell_auto_init) = shell_auto_init.as_mut()
+                        && let Some(command) = shell_auto_init.observe_byte(byte)
+                        && let Some(stdin) = stdin.as_ref()
+                    {
+                        spawn_delayed_send(stdin.clone(), command);
                     }
                 }
                 Ok(None) => break,
@@ -518,26 +582,49 @@ impl QemuRunner {
                 Self::kill_qemu(child)?;
                 break;
             }
+
+            if let Some(timeout) = timeout
+                && start.elapsed() >= timeout
+            {
+                Self::kill_qemu(child)?;
+                return Err(anyhow!("QEMU timed out after {}s", timeout.as_secs()));
+            }
         }
 
         Ok(())
     }
 
-    fn print_match_event(matched: &StreamMatch) {
-        match matched.kind {
-            StreamMatchKind::Success => println!(
-                "{}",
-                format!(
-                    "\n=== SUCCESS PATTERN MATCHED: {} ===",
-                    matched.matched_regex
-                )
-                .green()
-            ),
-            StreamMatchKind::Fail => println!(
-                "{}",
-                format!("\n=== FAIL PATTERN MATCHED: {} ===", matched.matched_regex).red()
-            ),
-        }
+    fn spawn_stdin_passthrough(stdin: Arc<Mutex<std::process::ChildStdin>>) {
+        thread::spawn(move || {
+            let mut stdin_reader = io::stdin().lock();
+            let mut buffer = [0u8; 1024];
+
+            loop {
+                match stdin_reader.read(&mut buffer) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        let result = (|| -> io::Result<()> {
+                            let mut child_stdin = stdin.lock().unwrap();
+                            child_stdin.write_all(&buffer[..n])?;
+                            child_stdin.flush()?;
+                            Ok(())
+                        })();
+
+                        if let Err(err) = result {
+                            if err.kind() != ErrorKind::BrokenPipe {
+                                warn!("failed to forward stdin to QEMU: {err}");
+                            }
+                            break;
+                        }
+                    }
+                    Err(err) if err.kind() == ErrorKind::Interrupted => continue,
+                    Err(err) => {
+                        warn!("failed to read stdin for QEMU passthrough: {err}");
+                        break;
+                    }
+                }
+            }
+        });
     }
 
     fn kill_qemu(child: &mut Child) -> anyhow::Result<()> {
@@ -547,39 +634,16 @@ impl QemuRunner {
             return Err(err.into());
         }
 
-        // 尝试恢复终端状态
-        let _ = disable_raw_mode();
-
-        // 使用 stty 命令恢复终端回显 (最可靠的方法)
-        let _ = std::process::Command::new("stty")
-            .arg("echo")
-            .arg("icanon")
-            .status();
-
-        // 刷新输出
-        let _ = io::stdout().flush();
+        restore_terminal_mode();
         println!();
 
         Ok(())
     }
 
-    fn preper_regex(&mut self) -> anyhow::Result<()> {
-        // Prepare regex patterns if needed
-        // Compile success regex patterns
-        for pattern in self.config.success_regex.iter() {
-            // Compile and store the regex
-            let regex =
-                regex::Regex::new(pattern).map_err(|e| anyhow!("success regex error: {e}"))?;
-            self.success_regex.push(regex);
-        }
-
-        // Compile fail regex patterns
-        for pattern in self.config.fail_regex.iter() {
-            // Compile and store the regex
-            let regex = regex::Regex::new(pattern).map_err(|e| anyhow!("fail regex error: {e}"))?;
-            self.fail_regex.push(regex);
-        }
-
+    fn prepare_regex(&mut self) -> anyhow::Result<()> {
+        let (success, fail) = compile_regexes(&self.config.success_regex, &self.config.fail_regex)?;
+        self.success_regex = success;
+        self.fail_regex = fail;
         Ok(())
     }
 }
@@ -588,20 +652,26 @@ impl QemuRunner {
 ///
 /// Configuration search priority:
 /// 1. Explicit path (if provided)
-/// 2. config_search_dir (if set): qemu-<arch>.toml → .qemu-<arch>.toml → qemu.toml → .qemu.toml
-/// 3. paths.manifest: qemu-<arch>.toml → .qemu-<arch>.toml → qemu.toml → .qemu.toml
+/// 2. workspace_dir: qemu-<arch>.toml → .qemu-<arch>.toml → qemu.toml → .qemu.toml
 ///
 /// When architecture is detected, architecture-specific files are checked first.
 pub(crate) fn resolve_qemu_config_path(
-    ctx: &AppContext,
+    tool: &Tool,
     explicit_path: Option<PathBuf>,
 ) -> anyhow::Result<PathBuf> {
-    // 优先级 1: 显式路径
+    resolve_qemu_config_path_in_dir(tool.workspace_dir(), tool.ctx.arch, explicit_path)
+}
+
+pub(crate) fn resolve_qemu_config_path_in_dir(
+    search_dir: &Path,
+    arch: Option<Architecture>,
+    explicit_path: Option<PathBuf>,
+) -> anyhow::Result<PathBuf> {
     if let Some(path) = explicit_path {
         return Ok(path);
     }
 
-    let arch_str = ctx.arch.map(|arch| format!("{arch:?}").to_lowercase());
+    let arch_str = arch.map(|arch| format!("{arch:?}").to_lowercase());
 
     // 文件名优先级顺序
     let candidates: Vec<String> = if let Some(ref arch) = arch_str {
@@ -615,45 +685,64 @@ pub(crate) fn resolve_qemu_config_path(
         vec!["qemu.toml".to_string(), ".qemu.toml".to_string()]
     };
 
-    // 优先级 2: 搜索 config_search_dir
-    if let Some(ref search_dir) = ctx.config_search_dir {
-        for filename in &candidates {
-            let path = search_dir.join(filename);
-            if path.exists() {
-                return Ok(path);
-            }
-        }
-    }
-
-    // 优先级 3: 搜索 paths.manifest
     for filename in &candidates {
-        let path = ctx.paths.manifest.join(filename);
+        let path = search_dir.join(filename);
         if path.exists() {
             return Ok(path);
         }
     }
 
-    // 优先级 4: 返回默认创建路径
     let default_filename = if let Some(ref arch) = arch_str {
         format!(".qemu-{}.toml", arch)
     } else {
         ".qemu.toml".to_string()
     };
 
-    if let Some(ref search_dir) = ctx.config_search_dir {
-        Ok(search_dir.join(default_filename))
-    } else {
-        Ok(ctx.paths.manifest.join(default_filename))
+    Ok(search_dir.join(default_filename))
+}
+
+fn timeout_duration(timeout: Option<u64>) -> Option<Duration> {
+    match timeout {
+        Some(0) | None => None,
+        Some(secs) => Some(Duration::from_secs(secs)),
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{QemuDefaultOverrides, build_default_qemu_config, resolve_qemu_config_path};
+    use super::{
+        QemuConfig, QemuDefaultOverrides, QemuRunner, build_default_qemu_config,
+        resolve_qemu_config_path, resolve_qemu_config_path_in_dir, timeout_duration,
+    };
     use object::Architecture;
+    use std::{path::PathBuf, time::Duration};
     use tempfile::TempDir;
 
-    use crate::ctx::{AppContext, PathConfig};
+    use crate::{
+        Tool, ToolConfig,
+        run::{
+            output_matcher::{ByteStreamMatcher, StreamMatchKind},
+            shell_init::ShellAutoInitMatcher,
+        },
+    };
+
+    fn write_single_crate_manifest(dir: &std::path::Path) {
+        std::fs::write(
+            dir.join("Cargo.toml"),
+            "[package]\nname = \"sample\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::write(dir.join("src/lib.rs"), "").unwrap();
+    }
+
+    fn make_tool(dir: &std::path::Path) -> Tool {
+        Tool::new(ToolConfig {
+            manifest: Some(dir.to_path_buf()),
+            ..Default::default()
+        })
+        .unwrap()
+    }
 
     #[test]
     fn default_qemu_config_keeps_existing_defaults_without_overrides() {
@@ -663,6 +752,7 @@ mod tests {
         assert_eq!(config.args, vec!["-nographic", "-cpu", "cortex-a53"]);
         assert!(config.success_regex.is_empty());
         assert!(config.fail_regex.is_empty());
+        assert_eq!(config.timeout, None);
     }
 
     #[test]
@@ -673,6 +763,7 @@ mod tests {
                 args: vec!["-m".into(), "512M".into()],
                 success_regex: vec!["PASS".into()],
                 fail_regex: vec!["FAIL".into()],
+                ..Default::default()
             },
         );
 
@@ -682,6 +773,7 @@ mod tests {
         );
         assert_eq!(config.success_regex, vec!["PASS"]);
         assert_eq!(config.fail_regex, vec!["FAIL"]);
+        assert_eq!(config.timeout, None);
     }
 
     #[test]
@@ -689,12 +781,111 @@ mod tests {
         let config = build_default_qemu_config(
             Some(Architecture::X86_64),
             QemuDefaultOverrides {
+                to_bin: Some(false),
                 args: vec!["-smp".into(), "2".into()],
                 ..Default::default()
             },
         );
 
+        assert!(!config.to_bin);
         assert_eq!(config.args, vec!["-nographic", "-smp", "2"]);
+        assert_eq!(config.timeout, None);
+    }
+
+    #[test]
+    fn qemu_timeout_zero_disables_timeout() {
+        assert_eq!(timeout_duration(None), None);
+        assert_eq!(timeout_duration(Some(0)), None);
+        assert_eq!(timeout_duration(Some(3)), Some(Duration::from_secs(3)));
+    }
+
+    #[test]
+    fn qemu_config_parses_timeout_from_toml() {
+        let config: QemuConfig = toml::from_str(
+            r#"
+args = ["-nographic"]
+uefi = false
+to_bin = true
+success_regex = []
+fail_regex = []
+timeout = 0
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(config.timeout, Some(0));
+    }
+
+    #[test]
+    fn qemu_config_normalize_rejects_shell_init_without_prefix() {
+        let mut config = QemuConfig {
+            shell_init_cmd: Some("root".into()),
+            ..Default::default()
+        };
+
+        let err = config.normalize("test config").unwrap_err();
+        assert!(err.to_string().contains("shell_prefix"));
+    }
+
+    #[test]
+    fn qemu_config_normalize_trims_shell_fields() {
+        let mut config = QemuConfig {
+            shell_prefix: Some(" login: ".into()),
+            shell_init_cmd: Some(" root ".into()),
+            ..Default::default()
+        };
+
+        config.normalize("test config").unwrap();
+
+        assert_eq!(config.shell_prefix.as_deref(), Some("login:"));
+        assert_eq!(config.shell_init_cmd.as_deref(), Some("root"));
+    }
+
+    #[test]
+    fn qemu_shell_auto_init_can_coexist_with_success_matcher() {
+        let mut matcher = ByteStreamMatcher::new(
+            vec![regex::Regex::new("ready").unwrap()],
+            vec![regex::Regex::new("__never_fail__").unwrap()],
+        );
+        let mut shell_init =
+            ShellAutoInitMatcher::new(Some("login:".to_string()), Some("root".to_string()))
+                .unwrap();
+        let mut sent = None;
+
+        for byte in b"login: system ready\n" {
+            if sent.is_none() {
+                sent = shell_init.observe_byte(*byte);
+            } else {
+                let _ = shell_init.observe_byte(*byte);
+            }
+            let _ = matcher.observe_byte(*byte);
+        }
+
+        let matched = matcher.matched().unwrap();
+        assert_eq!(matched.kind, StreamMatchKind::Success);
+        assert_eq!(sent.as_deref(), Some(&b"root\n"[..]));
+    }
+
+    #[test]
+    fn uefi_artifact_dir_prefers_runtime_artifact_dir() {
+        let runtime_dir = PathBuf::from("/tmp/ostool-runtime");
+        let tmp = TempDir::new().unwrap();
+        write_single_crate_manifest(tmp.path());
+        let mut tool = make_tool(tmp.path());
+        tool.ctx.artifacts.runtime_artifact_dir = Some(runtime_dir.clone());
+
+        let runner = QemuRunner {
+            tool: &mut tool,
+            config: QemuConfig::default(),
+            dtbdump: false,
+            success_regex: vec![],
+            fail_regex: vec![],
+        };
+
+        let resolved = runner
+            .uefi_artifact_dir(PathBuf::from("/tmp/ignored/kernel.bin").as_path())
+            .unwrap();
+        assert_eq!(resolved, runtime_dir);
     }
 
     // === QEMU 配置路径解析测试 ===
@@ -702,253 +893,133 @@ mod tests {
     #[test]
     fn qemu_config_explicit_path_wins() {
         let tmp = TempDir::new().unwrap();
-        let workspace = tmp.path().to_path_buf();
-        let manifest = workspace.join("manifest");
-        std::fs::create_dir(&manifest).unwrap();
-        let search_dir = workspace.join("config");
-        std::fs::create_dir(&search_dir).unwrap();
+        write_single_crate_manifest(tmp.path());
+        let tool = make_tool(tmp.path());
 
-        // 创建多个配置文件
-        std::fs::write(search_dir.join(".qemu.toml"), "").unwrap();
-        std::fs::write(manifest.join(".qemu.toml"), "").unwrap();
-
-        let ctx = AppContext {
-            paths: PathConfig {
-                workspace: workspace.clone(),
-                manifest,
-                ..Default::default()
-            },
-            config_search_dir: Some(search_dir),
-            ..Default::default()
-        };
-
-        // 显式路径应该优先
-        let explicit = workspace.join("custom.qemu.toml");
-        let result = resolve_qemu_config_path(&ctx, Some(explicit.clone())).unwrap();
+        let explicit = tmp.path().join("custom.qemu.toml");
+        let result = resolve_qemu_config_path(&tool, Some(explicit.clone())).unwrap();
         assert_eq!(result, explicit);
     }
 
     #[test]
-    fn qemu_config_search_dir_beats_manifest() {
+    fn qemu_config_workspace_path_used() {
         let tmp = TempDir::new().unwrap();
-        let workspace = tmp.path().to_path_buf();
-        let manifest = workspace.join("manifest");
-        std::fs::create_dir(&manifest).unwrap();
-        let search_dir = workspace.join("config");
-        std::fs::create_dir(&search_dir).unwrap();
+        write_single_crate_manifest(tmp.path());
+        std::fs::write(tmp.path().join("qemu-aarch64.toml"), "").unwrap();
 
-        // 创建多个配置文件
-        std::fs::write(search_dir.join("qemu-aarch64.toml"), "").unwrap();
-        std::fs::write(manifest.join(".qemu-aarch64.toml"), "").unwrap();
+        let mut tool = make_tool(tmp.path());
+        tool.ctx.arch = Some(Architecture::Aarch64);
 
-        let ctx = AppContext {
-            paths: PathConfig {
-                workspace,
-                manifest,
-                ..Default::default()
-            },
-            arch: Some(Architecture::Aarch64),
-            config_search_dir: Some(search_dir.clone()),
-            ..Default::default()
-        };
-
-        let result = resolve_qemu_config_path(&ctx, None).unwrap();
-        assert_eq!(result, search_dir.join("qemu-aarch64.toml"));
+        let result = resolve_qemu_config_path(&tool, None).unwrap();
+        assert_eq!(result, tmp.path().join("qemu-aarch64.toml"));
     }
 
     #[test]
     fn qemu_config_filename_priority() {
         let tmp = TempDir::new().unwrap();
-        let workspace = tmp.path().to_path_buf();
-        let manifest = workspace.join("manifest");
-        std::fs::create_dir(&manifest).unwrap();
+        write_single_crate_manifest(tmp.path());
+        let manifest = tmp.path().to_path_buf();
+        let mut tool = make_tool(tmp.path());
+        tool.ctx.arch = Some(Architecture::Aarch64);
 
-        let ctx = AppContext {
-            paths: PathConfig {
-                workspace,
-                manifest: manifest.clone(),
-                ..Default::default()
-            },
-            arch: Some(Architecture::Aarch64),
-            ..Default::default()
-        };
-
-        // 按顺序创建文件，每次验证优先级
         std::fs::write(manifest.join("qemu.toml"), "").unwrap();
-        let result = resolve_qemu_config_path(&ctx, None).unwrap();
+        let result = resolve_qemu_config_path(&tool, None).unwrap();
         assert_eq!(result, manifest.join("qemu.toml"));
 
         std::fs::write(manifest.join("qemu-aarch64.toml"), "").unwrap();
-        let result = resolve_qemu_config_path(&ctx, None).unwrap();
+        let result = resolve_qemu_config_path(&tool, None).unwrap();
         assert_eq!(result, manifest.join("qemu-aarch64.toml"));
     }
 
     #[test]
     fn qemu_config_default_path_with_search_dir() {
         let tmp = TempDir::new().unwrap();
-        let workspace = tmp.path().to_path_buf();
-        let manifest = workspace.join("manifest");
-        std::fs::create_dir(&manifest).unwrap();
-        let search_dir = workspace.join("config");
-        std::fs::create_dir(&search_dir).unwrap();
+        write_single_crate_manifest(tmp.path());
+        let tool = make_tool(tmp.path());
 
-        let ctx = AppContext {
-            paths: PathConfig {
-                workspace,
-                manifest,
-                ..Default::default()
-            },
-            config_search_dir: Some(search_dir.clone()),
-            ..Default::default()
-        };
-
-        let result = resolve_qemu_config_path(&ctx, None).unwrap();
-        assert_eq!(result, search_dir.join(".qemu.toml"));
-    }
-
-    #[test]
-    fn qemu_config_default_path_without_search_dir() {
-        let tmp = TempDir::new().unwrap();
-        let workspace = tmp.path().to_path_buf();
-        let manifest = workspace.join("manifest");
-        std::fs::create_dir(&manifest).unwrap();
-
-        let ctx = AppContext {
-            paths: PathConfig {
-                workspace,
-                manifest: manifest.clone(),
-                ..Default::default()
-            },
-            ..Default::default()
-        };
-
-        let result = resolve_qemu_config_path(&ctx, None).unwrap();
-        assert_eq!(result, manifest.join(".qemu.toml"));
+        let result = resolve_qemu_config_path(&tool, None).unwrap();
+        assert_eq!(result, tmp.path().join(".qemu.toml"));
     }
 
     #[test]
     fn qemu_config_default_path_with_arch() {
         let tmp = TempDir::new().unwrap();
-        let workspace = tmp.path().to_path_buf();
-        let manifest = workspace.join("manifest");
-        std::fs::create_dir(&manifest).unwrap();
+        write_single_crate_manifest(tmp.path());
+        let mut tool = make_tool(tmp.path());
+        tool.ctx.arch = Some(Architecture::Aarch64);
 
-        let ctx = AppContext {
-            paths: PathConfig {
-                workspace,
-                manifest: manifest.clone(),
-                ..Default::default()
-            },
-            arch: Some(Architecture::Aarch64),
-            ..Default::default()
-        };
-
-        let result = resolve_qemu_config_path(&ctx, None).unwrap();
-        assert_eq!(result, manifest.join(".qemu-aarch64.toml"));
+        let result = resolve_qemu_config_path(&tool, None).unwrap();
+        assert_eq!(result, tmp.path().join(".qemu-aarch64.toml"));
     }
 
     #[test]
     fn qemu_config_without_arch() {
         let tmp = TempDir::new().unwrap();
-        let workspace = tmp.path().to_path_buf();
-        let manifest = workspace.join("manifest");
-        std::fs::create_dir(&manifest).unwrap();
+        write_single_crate_manifest(tmp.path());
+        std::fs::write(tmp.path().join("qemu-aarch64.toml"), "").unwrap();
+        std::fs::write(tmp.path().join("qemu.toml"), "").unwrap();
 
-        // 创建架构特定文件
-        std::fs::write(manifest.join("qemu-aarch64.toml"), "").unwrap();
-
-        let ctx = AppContext {
-            paths: PathConfig {
-                workspace,
-                manifest: manifest.clone(),
-                ..Default::default()
-            },
-            arch: None, // 无架构
-            ..Default::default()
-        };
-
-        // 应该跳过架构特定文件，使用通用文件
-        std::fs::write(manifest.join("qemu.toml"), "").unwrap();
-        let result = resolve_qemu_config_path(&ctx, None).unwrap();
-        assert_eq!(result, manifest.join("qemu.toml"));
+        let tool = make_tool(tmp.path());
+        let result = resolve_qemu_config_path(&tool, None).unwrap();
+        assert_eq!(result, tmp.path().join("qemu.toml"));
     }
 
-    // === Build 配置解析测试 ===
+    #[test]
+    fn qemu_config_search_dir_prefers_arch_specific_files() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("qemu-aarch64.toml"), "").unwrap();
+        std::fs::write(tmp.path().join("qemu.toml"), "").unwrap();
+
+        let result =
+            resolve_qemu_config_path_in_dir(tmp.path(), Some(Architecture::Aarch64), None).unwrap();
+        assert_eq!(result, tmp.path().join("qemu-aarch64.toml"));
+    }
+
+    #[test]
+    fn qemu_config_search_dir_uses_hidden_generic_before_hidden_default_creation() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(tmp.path().join(".qemu.toml"), "").unwrap();
+
+        let result =
+            resolve_qemu_config_path_in_dir(tmp.path(), Some(Architecture::Aarch64), None).unwrap();
+        assert_eq!(result, tmp.path().join(".qemu.toml"));
+    }
+
+    #[test]
+    fn qemu_config_search_dir_defaults_to_arch_specific_hidden_file() {
+        let tmp = TempDir::new().unwrap();
+
+        let result =
+            resolve_qemu_config_path_in_dir(tmp.path(), Some(Architecture::Aarch64), None).unwrap();
+        assert_eq!(result, tmp.path().join(".qemu-aarch64.toml"));
+    }
+
+    #[test]
+    fn qemu_config_search_dir_defaults_without_arch() {
+        let tmp = TempDir::new().unwrap();
+
+        let result = resolve_qemu_config_path_in_dir(tmp.path(), None, None).unwrap();
+        assert_eq!(result, tmp.path().join(".qemu.toml"));
+    }
 
     #[test]
     fn build_config_explicit_path_wins() {
         let tmp = TempDir::new().unwrap();
-        let workspace = tmp.path().to_path_buf();
-        let manifest = workspace.join("manifest");
-        std::fs::create_dir(&manifest).unwrap();
-        let search_dir = workspace.join("config");
-        std::fs::create_dir(&search_dir).unwrap();
+        write_single_crate_manifest(tmp.path());
+        let tool = make_tool(tmp.path());
 
-        // 创建多个配置文件
-        std::fs::write(search_dir.join(".build.toml"), "").unwrap();
-        std::fs::write(workspace.join(".build.toml"), "").unwrap();
-
-        let ctx = AppContext {
-            paths: PathConfig {
-                workspace: workspace.clone(),
-                manifest,
-                ..Default::default()
-            },
-            config_search_dir: Some(search_dir),
-            ..Default::default()
-        };
-
-        // 显式路径应该优先
-        let explicit = workspace.join("custom.build.toml");
-        let result = ctx.resolve_build_config_path(Some(explicit.clone()));
+        let explicit = tmp.path().join("custom.build.toml");
+        let result = tool.resolve_build_config_path(Some(explicit.clone()));
         assert_eq!(result, explicit);
     }
 
     #[test]
-    fn build_config_search_dir_beats_workspace() {
+    fn build_config_defaults_to_workspace_root() {
         let tmp = TempDir::new().unwrap();
-        let workspace = tmp.path().to_path_buf();
-        let manifest = workspace.join("manifest");
-        std::fs::create_dir(&manifest).unwrap();
-        let search_dir = workspace.join("config");
-        std::fs::create_dir(&search_dir).unwrap();
+        write_single_crate_manifest(tmp.path());
+        let tool = make_tool(tmp.path());
 
-        // 创建多个配置文件
-        std::fs::write(search_dir.join(".build.toml"), "[system]").unwrap();
-        std::fs::write(workspace.join(".build.toml"), "[system]").unwrap();
-
-        let ctx = AppContext {
-            paths: PathConfig {
-                workspace: workspace.clone(),
-                manifest,
-                ..Default::default()
-            },
-            config_search_dir: Some(search_dir.clone()),
-            ..Default::default()
-        };
-
-        let result = ctx.resolve_build_config_path(None);
-        assert_eq!(result, search_dir.join(".build.toml"));
-    }
-
-    #[test]
-    fn build_config_fallback_to_workspace() {
-        let tmp = TempDir::new().unwrap();
-        let workspace = tmp.path().to_path_buf();
-        let manifest = workspace.join("manifest");
-        std::fs::create_dir(&manifest).unwrap();
-
-        let ctx = AppContext {
-            paths: PathConfig {
-                workspace: workspace.clone(),
-                manifest,
-                ..Default::default()
-            },
-            config_search_dir: None,
-            ..Default::default()
-        };
-
-        let result = ctx.resolve_build_config_path(None);
-        assert_eq!(result, workspace.join(".build.toml"));
+        let result = tool.resolve_build_config_path(None);
+        assert_eq!(result, tmp.path().join(".build.toml"));
     }
 }

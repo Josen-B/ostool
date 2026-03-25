@@ -2,16 +2,15 @@ use std::{
     env,
     path::PathBuf,
     process::{ExitCode, exit},
+    sync::OnceLock,
 };
 
 use clap::{Parser, Subcommand};
-use log::{LevelFilter, debug};
+use colored::Colorize as _;
+use log::debug;
 use ostool::{
-    ctx::{AppContext, OutputConfig, PathConfig},
-    run::{
-        qemu,
-        uboot::{self, RunUbootArgs},
-    },
+    Tool, ToolConfig, logger, resolve_manifest_context,
+    run::{qemu, uboot::RunUbootArgs},
 };
 
 #[derive(Debug, Parser, Clone)]
@@ -73,6 +72,8 @@ enum SubCommands {
     Uboot(CliUboot),
 }
 
+static LOG_PATH: OnceLock<PathBuf> = OnceLock::new();
+
 #[derive(Debug, Parser, Clone)]
 struct CliUboot {
     #[arg(allow_hyphen_values = true)]
@@ -84,86 +85,89 @@ async fn main() -> ExitCode {
     match try_main().await {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
-            eprintln!("Error: {err:#}");
-            eprintln!("\nTrace:\n{err:?}");
+            report_error(&err);
             ExitCode::FAILURE
         }
     }
 }
 
 async fn try_main() -> anyhow::Result<()> {
-    env_logger::builder()
-        .format_module_path(false)
-        .filter_level(LevelFilter::Info)
-        .parse_default_env()
-        .init();
-
     let args = RunnerArgs::parse();
+    if env::var("CARGO").is_err() {
+        println!(
+            "{}",
+            "This binary may only be called via `cargo ndk-runner`."
+                .red()
+                .bold()
+        );
+        exit(1);
+    }
 
+    let manifest_dir: PathBuf = env::var("CARGO_MANIFEST_DIR")?.into();
+    let manifest = manifest_dir.join("Cargo.toml");
+    let manifest = resolve_manifest_context(Some(manifest))?;
+    let log_path = logger::init_file_logger(&manifest.workspace_dir)?;
+    let _ = LOG_PATH.set(log_path.clone());
+    debug!(
+        "Logging initialized at {} for manifest {}",
+        log_path.display(),
+        manifest.manifest_path.display()
+    );
     debug!("Parsed arguments: {:#?}", args);
 
     if args.no_run {
         exit(0);
     }
 
-    if env::var("CARGO").is_err() {
-        eprintln!("This binary may only be called via `cargo ndk-runner`.");
-        exit(1);
-    }
-
-    let manifest_dir: PathBuf = env::var("CARGO_MANIFEST_DIR")?.into();
-
-    let workspace_folder = match env::var("WORKSPACE_FOLDER") {
-        Ok(dir) => PathBuf::from(dir),
-        Err(_) => manifest_dir.clone(),
-    };
-
     let bin_dir: Option<PathBuf> = args.bin_dir.map(PathBuf::from);
     let build_dir: Option<PathBuf> = args.build_dir.map(PathBuf::from);
 
-    let output_config = OutputConfig { build_dir, bin_dir };
+    let mut tool = Tool::new(ToolConfig {
+        manifest: Some(manifest.manifest_path),
+        build_dir,
+        bin_dir,
+        debug: args.debug,
+    })?;
 
-    let mut app = AppContext {
-        paths: PathConfig {
-            workspace: workspace_folder,
-            manifest: manifest_dir,
-            config: output_config,
-            ..Default::default()
-        },
-        ..Default::default()
-    };
+    tool.set_elf_path(args.elf).await?;
+    tool.objcopy_elf()?;
 
-    app.set_elf_path(args.elf).await?;
-    app.objcopy_elf()?;
-
-    app.debug = args.debug;
     if args.to_bin {
-        app.objcopy_output_bin()?;
+        tool.objcopy_output_bin()?;
     }
 
     match args.command {
         Some(SubCommands::Uboot(_)) => {
-            uboot::run_uboot(
-                app,
-                RunUbootArgs {
-                    config: args.config,
-                    show_output: args.show_output,
-                },
-            )
+            tool.run_uboot(RunUbootArgs {
+                config: args.config,
+                show_output: args.show_output,
+            })
             .await?;
         }
         None => {
-            qemu::run_qemu(
-                app,
-                qemu::RunQemuArgs {
-                    qemu_config: args.config,
-                    dtb_dump: args.dtb_dump,
-                    show_output: args.show_output,
-                },
-            )
+            tool.run_qemu(qemu::RunQemuArgs {
+                qemu_config: args.config,
+                dtb_dump: args.dtb_dump,
+                show_output: args.show_output,
+            })
             .await?;
         }
     }
 
     Ok(())
+}
+
+fn report_error(err: &anyhow::Error) {
+    log::error!("{err:#}");
+    log::error!("Trace:\n{err:?}");
+
+    println!("{}", format!("Error: {err:#}").red().bold());
+    println!("{}", format!("\nTrace:\n{err:?}").red());
+
+    if let Some(log_path) = LOG_PATH.get() {
+        println!(
+            "{}",
+            format!("Log file: {}", log_path.display()).yellow().bold()
+        );
+    }
 }
