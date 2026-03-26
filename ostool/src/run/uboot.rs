@@ -331,6 +331,7 @@ impl Runner<'_> {
             object::Architecture::Aarch64 => "arm64",
             object::Architecture::Arm => "arm",
             object::Architecture::LoongArch64 => "loongarch64",
+            object::Architecture::Riscv64 => "riscv",
             _ => todo!(),
         };
 
@@ -341,7 +342,7 @@ impl Runner<'_> {
                     .with_type("kernel")
                     .with_arch(arch)
                     .with_os("linux")
-                    .with_compression(true)
+                    .with_compression(false)
                     .with_load_address(kernel_load_addr)
                     .with_entry_point(kernel_entry_addr),
             );
