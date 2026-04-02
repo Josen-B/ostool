@@ -11,9 +11,9 @@ repository = "https://github.com/drivercraft/ostool"
 version = "0.11.2"
 
 [package.metadata.binstall]
-bin-dir = "{ name }-{ target }-v{ version }/{ bin }{ binary-ext }"
+bin-dir = "{ name }-{ version }-{ target }/{ bin }{ binary-ext }"
 pkg-fmt = "tgz"
-pkg-url = "{ repo }/releases/download/{ name }-v{ version }/{ name }-{ target }-v{ version }{ archive-suffix }"
+pkg-url = "{ repo }/releases/download/{ name }-v{ version }/{ name }-{ version }-{ target }.{ archive-format }"
 
 [[bin]]
 name = "ostool"
@@ -28,6 +28,7 @@ ui-log = ["jkconfig/logging"]
 
 [dependencies]
 anyhow = { workspace = true, features = ["backtrace"] }
+async-trait = "0.1"
 byte-unit = "5.1"
 cargo_metadata = "0.23"
 clap = { workspace = true, features = ["derive"] }
@@ -38,18 +39,19 @@ env_logger = { workspace = true }
 fitimage = { version = "0.1", path = "../fitimage" }
 futures = "0.3"
 indicatif = "0.18"
-jkconfig = { version = "0.1", path = "../jkconfig" }
+jkconfig = { version = "0.1", path = "../jkconfig", default-features = false }
 log = { workspace = true }
 network-interface = "2"
 object = "0.38"
 ratatui = "0.29"
-reqwest = { version = "0.13" }
+reqwest = { version = "0.13", features = ["json"] }
 schemars = { workspace = true, features = ["derive"] }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 serialport = "4.6"
 tftpd = "0.5"
 tokio = { workspace = true, features = ["full"] }
+tokio-util = { version = "0.7", features = ["compat"] }
 toml = { workspace = true }
 uboot-shell = { version = "0.2", path = "../uboot-shell" }
 
@@ -59,7 +61,9 @@ sha2 = "0.10"
 tar = "0.4"
 thiserror = { workspace = true }
 ureq = "3.0"
-chrono = "0.4.44"
+chrono = { version = "0.4.44", features = ["serde"] }
+tokio-tungstenite = "0.28"
+tokio-serial = "5.4"
 
 [dev-dependencies]
 tempfile = "3"
