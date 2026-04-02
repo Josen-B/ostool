@@ -1,18 +1,21 @@
-use std::{path::PathBuf, process::ExitCode, sync::OnceLock};
+use std::{path::PathBuf, process::ExitCode};
 
 use anyhow::Result;
 use clap::*;
 use colored::Colorize as _;
+use env_logger::Env;
 
 use log::info;
 use ostool::{
     Tool, ToolConfig, board,
-    board::{client::BoardServerClient, config::BoardRunConfig, session::BoardSession},
+    board::{
+        client::BoardServerClient, config::BoardRunConfig, config_tui::run_board_config_tui,
+        global_config::LoadedBoardGlobalConfig, session::BoardSession,
+    },
     build::{
         self, CargoQemuAppendArgs, CargoQemuOverrideArgs, CargoQemuRunnerArgs, CargoRunnerKind,
         CargoUbootRunnerArgs, cargo_builder::CargoBuilder,
     },
-    logger,
     menuconfig::{MenuConfigHandler, MenuConfigMode},
     resolve_manifest_context,
     run::{qemu::RunQemuArgs, uboot::RunUbootArgs},
@@ -26,8 +29,6 @@ struct Cli {
     #[command(subcommand)]
     command: SubCommands,
 }
-
-static LOG_PATH: OnceLock<PathBuf> = OnceLock::new();
 
 #[derive(Subcommand, Debug)]
 enum SubCommands {
@@ -48,14 +49,14 @@ enum SubCommands {
     },
 }
 
-#[derive(Args, Debug, Clone)]
-struct ServerArgs {
+#[derive(Args, Debug, Default, Clone)]
+struct BoardServerArgs {
     /// ostool-server host
-    #[arg(long, default_value = "127.0.0.1")]
-    server: String,
+    #[arg(long)]
+    server: Option<String>,
     /// ostool-server port
-    #[arg(long, default_value_t = 8080)]
-    port: u16,
+    #[arg(long)]
+    port: Option<u16>,
 }
 
 #[derive(Args, Debug)]
@@ -66,7 +67,9 @@ struct BoardArgs {
 
 #[derive(Subcommand, Debug)]
 enum BoardSubCommands {
-    Ls(ServerArgs),
+    Ls(BoardServerArgs),
+    Run(BoardRunArgs),
+    Config,
 }
 
 #[derive(Args, Debug)]
@@ -96,24 +99,13 @@ struct BoardRunArgs {
     #[arg(long = "board-config")]
     board_config: Option<PathBuf>,
     #[command(flatten)]
-    server: RunBoardServerArgs,
-}
-
-#[derive(Args, Debug, Default)]
-struct RunBoardServerArgs {
-    /// ostool-server host
-    #[arg(long)]
-    server: Option<String>,
-    /// ostool-server port
-    #[arg(long)]
-    port: Option<u16>,
+    server: BoardServerArgs,
 }
 
 #[derive(Subcommand, Debug)]
 enum RunSubCommands {
     Qemu(RunQemuCommand),
     Uboot(RunUbootCommand),
-    Board(BoardRunArgs),
 }
 
 #[derive(Args, Debug, Default)]
@@ -153,30 +145,30 @@ async fn main() -> ExitCode {
 }
 
 async fn try_main() -> Result<()> {
+    env_logger::Builder::from_env(Env::default().default_filter_or("info")).init();
+
     let Cli { manifest, command } = Cli::parse();
 
     match command {
-        SubCommands::Board(args) => {
-            let _ = env_logger::try_init();
-            match args.command {
-                BoardSubCommands::Ls(server) => {
-                    board::list_boards(&server.server, server.port).await?;
-                }
+        SubCommands::Board(args) => match args.command {
+            BoardSubCommands::Ls(server) => {
+                let global_config = load_board_global_config_with_notice()?;
+                let (server, port) =
+                    global_config.resolve_server(server.server.as_deref(), server.port);
+                board::list_boards(&server, port).await?;
             }
-        }
-        SubCommands::Build { config } => {
-            let mut tool = init_tool(manifest)?;
-            tool.build(config).await?;
-        }
-        SubCommands::Run { command } => match command {
-            RunSubCommands::Board(args) => {
+            BoardSubCommands::Run(args) => {
+                let global_config = load_board_global_config_with_notice()?;
                 let mut tool = init_tool(manifest.clone())?;
                 let board_config =
                     BoardRunConfig::load_or_create(&tool, args.board_config.clone()).await?;
                 prepare_uboot_artifacts(&mut tool, args.config.clone()).await?;
 
-                let (server, port) =
-                    board_config.resolve_server(args.server.server.as_deref(), args.server.port);
+                let (server, port) = board_config.resolve_server(
+                    args.server.server.as_deref(),
+                    args.server.port,
+                    &global_config.board,
+                );
                 let client = BoardServerClient::new(&server, port)?;
                 let session =
                     BoardSession::acquire(client.clone(), &board_config.board_type).await?;
@@ -210,6 +202,15 @@ async fn try_main() -> Result<()> {
                     }
                 }
             }
+            BoardSubCommands::Config => {
+                run_board_config_tui()?;
+            }
+        },
+        SubCommands::Build { config } => {
+            let mut tool = init_tool(manifest)?;
+            tool.build(config).await?;
+        }
+        SubCommands::Run { command } => match command {
             RunSubCommands::Qemu(args) => {
                 let RunQemuCommand { config, qemu } = args;
                 let qemu_config = qemu.qemu_config.clone();
@@ -332,13 +333,7 @@ async fn prepare_uboot_artifacts(
 
 fn init_tool(manifest_arg: Option<PathBuf>) -> Result<Tool> {
     let manifest = resolve_manifest_context(manifest_arg.clone())?;
-    let log_path = logger::init_file_logger(&manifest.workspace_dir)?;
-    let _ = LOG_PATH.set(log_path.clone());
-    info!(
-        "Logging initialized at {} for manifest {}",
-        log_path.display(),
-        manifest.manifest_path.display()
-    );
+    info!("Using manifest {}", manifest.manifest_path.display());
 
     Tool::new(ToolConfig {
         manifest: manifest_arg,
@@ -352,13 +347,14 @@ fn report_error(err: &anyhow::Error) {
 
     println!("{}", format!("Error: {err:#}").red().bold());
     println!("{}", format!("\nTrace:\n{err:?}").red());
+}
 
-    if let Some(log_path) = LOG_PATH.get() {
-        println!(
-            "{}",
-            format!("Log file: {}", log_path.display()).yellow().bold()
-        );
+fn load_board_global_config_with_notice() -> Result<LoadedBoardGlobalConfig> {
+    let loaded = LoadedBoardGlobalConfig::load_or_create()?;
+    if loaded.created {
+        println!("Created default board config: {}", loaded.path.display());
     }
+    Ok(loaded)
 }
 
 impl From<QemuArgs> for RunQemuArgs {
@@ -384,7 +380,7 @@ impl From<UbootArgs> for RunUbootArgs {
 mod tests {
     use clap::Parser;
 
-    use super::{BoardArgs, BoardSubCommands, Cli, RunSubCommands, SubCommands};
+    use super::{BoardArgs, BoardSubCommands, Cli, SubCommands};
 
     #[test]
     fn parse_board_ls_with_server_args() {
@@ -397,21 +393,21 @@ mod tests {
             SubCommands::Board(BoardArgs {
                 command: BoardSubCommands::Ls(server),
             }) => {
-                assert_eq!(server.server, "10.0.0.2");
-                assert_eq!(server.port, 9000);
+                assert_eq!(server.server.as_deref(), Some("10.0.0.2"));
+                assert_eq!(server.port, Some(9000));
             }
             other => panic!("unexpected command: {other:?}"),
         }
     }
 
     #[test]
-    fn parse_run_board_with_board_type() {
-        let cli = Cli::try_parse_from(["ostool", "run", "board"]).unwrap();
+    fn parse_board_run_with_board_type() {
+        let cli = Cli::try_parse_from(["ostool", "board", "run"]).unwrap();
 
         match cli.command {
-            SubCommands::Run {
-                command: RunSubCommands::Board(args),
-            } => {
+            SubCommands::Board(BoardArgs {
+                command: BoardSubCommands::Run(args),
+            }) => {
                 assert!(args.config.is_none());
                 assert!(args.board_config.is_none());
                 assert!(args.server.server.is_none());
@@ -422,11 +418,11 @@ mod tests {
     }
 
     #[test]
-    fn parse_run_board_with_build_and_board_config() {
+    fn parse_board_run_with_build_and_board_config() {
         let cli = Cli::try_parse_from([
             "ostool",
-            "run",
             "board",
+            "run",
             "--config",
             "board.build.toml",
             "--board-config",
@@ -439,9 +435,9 @@ mod tests {
         .unwrap();
 
         match cli.command {
-            SubCommands::Run {
-                command: RunSubCommands::Board(args),
-            } => {
+            SubCommands::Board(BoardArgs {
+                command: BoardSubCommands::Run(args),
+            }) => {
                 assert_eq!(
                     args.config.as_deref(),
                     Some(std::path::Path::new("board.build.toml"))
@@ -455,5 +451,25 @@ mod tests {
             }
             other => panic!("unexpected command: {other:?}"),
         }
+    }
+
+    #[test]
+    fn parse_board_config_command() {
+        let cli = Cli::try_parse_from(["ostool", "board", "config"]).unwrap();
+
+        match cli.command {
+            SubCommands::Board(BoardArgs {
+                command: BoardSubCommands::Config,
+            }) => {}
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_run_board_is_rejected() {
+        let err = Cli::try_parse_from(["ostool", "run", "board"]).unwrap_err();
+        let rendered = err.to_string();
+        assert!(rendered.contains("unrecognized subcommand"));
+        assert!(rendered.contains("board"));
     }
 }

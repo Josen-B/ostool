@@ -7,7 +7,7 @@ keywords = ["tui", "config", "json-schema", "terminal"]
 license = "MIT OR Apache-2.0"
 name = "jkconfig"
 repository = "https://github.com/drivercraft/ostool"
-version = "0.2.0"
+version = "0.2.1"
 
 [[bin]]
 name = "jkconfig"
@@ -30,9 +30,6 @@ toml = {workspace = true}
 # Error handling
 thiserror = {workspace = true}
 
-# Logging
-log = {workspace = true}
-
 # Web server dependencies (optional)
 axum = {version = "0.8", optional = true}
 chrono = {version = "0.4", optional = true}
@@ -43,9 +40,7 @@ tower-http = {version = "0.6", features = ["fs", "cors"], optional = true}
 [features]
 default = ["web"]
 web = ["axum", "tower", "tower-http", "chrono"]
-logging = []
 
 [dev-dependencies]
-env_logger = "0.11"
 schemars = {workspace=true, features = ["derive"]}
 tokio-test = "0.4"
