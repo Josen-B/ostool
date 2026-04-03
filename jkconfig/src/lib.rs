@@ -1,13 +1,13 @@
 //! # jkconfig
 //!
-//! A Cursive-based TUI component library for JSON Schema configuration.
+//! A Ratatui-based TUI component library for JSON Schema configuration.
 //!
 //! JKConfig automatically generates interactive terminal forms from JSON Schema
 //! definitions, making configuration management intuitive and error-free.
 //!
 //! ## Features
 //!
-//! - Beautiful TUI interface built with [Cursive](https://github.com/gyscos/cursive)
+//! - Beautiful TUI interface built with [Ratatui](https://github.com/ratatui/ratatui)
 //! - JSON Schema driven UI generation (Draft 2020-12)
 //! - Support for multiple data types: String, Integer, Number, Boolean, Enum, Array, Object, OneOf
 //! - Multi-format support: TOML and JSON configuration files
@@ -18,16 +18,17 @@
 //! ## Quick Start
 //!
 //! ```rust,no_run
-//! use jkconfig::data::AppData;
+//! use jkconfig::data::{AppState, ConfigDocument};
 //!
 //! // Load configuration with schema
-//! let app_data = AppData::new(
+//! let document = ConfigDocument::new(
 //!     Some("config.toml"),
 //!     Some("config-schema.json")
 //! ).unwrap();
+//! let app_state = AppState::new(document);
 //!
 //! // Access the configuration tree
-//! let json_value = app_data.root.as_json();
+//! let json_value = app_state.document.as_json();
 //! ```
 //!
 //! ## Modules

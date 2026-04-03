@@ -1,17 +1,13 @@
 use std::path::Path;
 
 use anyhow::Context;
-pub use cursive;
-use cursive::{Cursive, CursiveExt, event::Key};
 use schemars::JsonSchema;
 use serde::de::DeserializeOwned;
 
 use crate::{
-    data::AppData,
-    ui::{components::menu::menu_view, handle_back, handle_quit, handle_save},
+    data::{AppState, ConfigDocument, ElementHook},
+    ui::run_tui,
 };
-
-pub use crate::data::app_data::ElemHock;
 
 /// Run the configuration editor workflow for a typed config.
 ///
@@ -24,7 +20,7 @@ pub use crate::data::app_data::ElemHock;
 pub async fn run<C: JsonSchema + DeserializeOwned>(
     config_path: impl AsRef<Path>,
     always_use_ui: bool,
-    elem_hocks: &[ElemHock],
+    element_hooks: &[ElementHook],
 ) -> anyhow::Result<Option<C>> {
     let config_path = config_path.as_ref();
     let schema = schemars::schema_for!(C);
@@ -45,11 +41,12 @@ pub async fn run<C: JsonSchema + DeserializeOwned>(
         return Ok(Some(c));
     }
 
-    let app = get_content_by_ui(config_path, &content, &schema_json, elem_hocks).await?;
+    let app = get_content_by_ui(config_path, &content, &schema_json, element_hooks).await?;
     if !app.needs_save {
         return Ok(None);
     }
-    let val = app.root.as_json();
+    app.validate_before_save()?;
+    let val = app.document.as_json();
 
     let c = match ext.as_str() {
         "json" => serde_json::from_value(val.clone())?,
@@ -99,34 +96,11 @@ async fn get_content_by_ui(
     config: impl AsRef<Path>,
     content: &str,
     schema: &serde_json::Value,
-    elem_hocks: &[ElemHock],
-) -> anyhow::Result<AppData> {
-    let mut app_data = AppData::new_with_init_and_schema(content, config.as_ref(), schema)?;
-    app_data.elem_hocks = elem_hocks.to_vec();
-
-    let title = app_data.root.title.clone();
-    let fields = app_data.root.menu().fields();
-
-    // 创建Cursive应用
-    let mut siv = Cursive::default();
-
-    // 设置AppData为user_data
-    siv.set_user_data(app_data);
-
-    // 添加全局键盘事件处理
-    siv.add_global_callback('q', handle_quit);
-    siv.add_global_callback('Q', handle_quit);
-    siv.add_global_callback('s', handle_save);
-    siv.add_global_callback('S', handle_save);
-    siv.add_global_callback(Key::Esc, handle_back);
-    // 初始菜单路径为空
-    siv.add_fullscreen_layer(menu_view(&title, "", fields));
-
-    // 运行应用
-    siv.run_crossterm()
-        .map_err(|err| anyhow::anyhow!("failed to launch interactive config UI: {err}"))?;
-
-    let app = siv.take_user_data::<AppData>().unwrap();
-    // println!("Data: \n{:#?}", app.root);
-    Ok(app)
+    element_hooks: &[ElementHook],
+) -> anyhow::Result<AppState> {
+    let document = ConfigDocument::new_with_init_and_schema(content, config.as_ref(), schema)?;
+    let mut app_state = AppState::new(document);
+    app_state.element_hooks = element_hooks.to_vec();
+    run_tui(app_state)
+        .map_err(|err| anyhow::anyhow!("failed to launch interactive config UI: {err}"))
 }
