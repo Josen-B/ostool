@@ -218,13 +218,13 @@ async fn try_main() -> Result<()> {
                             ),
                             None => None,
                         };
-                        let kind = CargoRunnerKind::Qemu(CargoQemuRunnerArgs {
+                        let kind = CargoRunnerKind::new_qemu(CargoQemuRunnerArgs {
                             qemu: qemu_config,
                             debug,
                             dtb_dump,
                             show_output: true,
                         });
-                        tool.cargo_run(&config, &kind).await?;
+                        tool.cargo_run(config, &kind).await?;
                     }
                     build::config::BuildSystem::Custom(custom_cfg) => {
                         tool.build_with_config(&build_config).await?;
@@ -262,11 +262,11 @@ async fn try_main() -> Result<()> {
                             ),
                             None => None,
                         };
-                        let kind = CargoRunnerKind::Uboot(CargoUbootRunnerArgs {
+                        let kind = CargoRunnerKind::new_uboot(CargoUbootRunnerArgs {
                             uboot: uboot_config,
                             show_output: true,
                         });
-                        tool.cargo_run(&config, &kind).await?;
+                        tool.cargo_run(config, &kind).await?;
                     }
                     build::config::BuildSystem::Custom(custom_cfg) => {
                         tool.build_with_config(&build_config).await?;
