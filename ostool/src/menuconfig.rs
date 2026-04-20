@@ -15,6 +15,7 @@ use log::info;
 use tokio::fs;
 
 use crate::Tool;
+use crate::build::config::BuildConfig;
 use crate::run::qemu::QemuConfig;
 use crate::run::uboot::UbootConfig;
 use crate::utils::PathResultExt;
@@ -59,7 +60,18 @@ impl MenuConfigHandler {
     }
 
     async fn handle_default_config(tool: &mut Tool) -> Result<()> {
-        tool.prepare_build_config(None, true).await?;
+        let config_path = tool.resolve_build_config_path(None);
+        tool.ctx_mut().build_config_path = Some(config_path.clone());
+
+        let config = jkconfig::run::<BuildConfig>(config_path.clone(), true, &tool.ui_hooks())
+            .await
+            .with_context(|| format!("failed to load build config: {}", config_path.display()))?;
+
+        if let Some(config) = config {
+            tool.ctx_mut().build_config = Some(config);
+        } else {
+            println!("\n未更改构建配置");
+        }
 
         Ok(())
     }
@@ -122,5 +134,40 @@ impl MenuConfigHandler {
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::build::config::BuildConfig;
+    use jkconfig::data::menu::MenuRoot;
+    use jkconfig::data::types::ElementType;
+    use schemars::schema_for;
+
+    #[test]
+    fn test_log_field_is_enum_not_oneof() {
+        let schema = schema_for!(BuildConfig);
+        let menu = MenuRoot::try_from(schema.as_value()).expect("schema parse ok");
+
+        fn find_log(elem: &ElementType) -> Option<&ElementType> {
+            match elem {
+                ElementType::Menu(m) => m.children.iter().find_map(|c| find_log(c)),
+                ElementType::OneOf(o) => o.variants.iter().find_map(|v| find_log(v)),
+                ElementType::Item(item) if item.base.key().ends_with("log") => Some(elem),
+                _ => None,
+            }
+        }
+
+        let log_elem = find_log(&menu.menu).expect("log field should exist");
+        match log_elem {
+            ElementType::Item(item) => {
+                assert!(
+                    matches!(&item.item_type, jkconfig::data::item::ItemType::Enum(e) if e.variants.len() == 5),
+                    "log should be Enum with 5 variants, got: {:?}",
+                    item.item_type
+                );
+            }
+            other => panic!("log should be Item(Enum), got: {:?}", other),
+        }
     }
 }

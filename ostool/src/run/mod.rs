@@ -11,7 +11,7 @@
 pub mod qemu;
 
 /// TFTP server for network booting.
-pub mod tftp;
+pub(crate) mod tftp;
 
 /// U-Boot bootloader integration.
 pub mod uboot;
@@ -19,8 +19,10 @@ pub mod uboot;
 /// Shared byte-stream matcher for runtime output detection.
 mod output_matcher;
 
+pub use output_matcher::{ByteStreamMatcher, StreamMatch, StreamMatchKind};
+
 /// OVMF prebuilt firmware downloader (internal).
 mod ovmf_prebuilt;
 
 /// Shared shell auto-init matcher and delayed command sender.
-mod shell_init;
+pub(crate) mod shell_init;

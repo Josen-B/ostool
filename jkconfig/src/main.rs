@@ -1,10 +1,9 @@
 use clap::{Parser, Subcommand};
-use cursive::{Cursive, CursiveExt, event::Key};
 use std::path::PathBuf;
 
 use jkconfig::{
-    data::AppData,
-    ui::{components::menu::menu_view, handle_back, handle_quit, handle_save},
+    data::{AppState, ConfigDocument},
+    ui::run_tui as launch_tui,
 };
 
 // mod menu_view;
@@ -55,16 +54,17 @@ fn main() -> anyhow::Result<()> {
     let schema_file = schema_path.as_deref();
 
     // 初始化AppData
-    let app_data = AppData::new(config_file, schema_file)?;
+    let document = ConfigDocument::new(config_file, schema_file)?;
+    let app_state = AppState::new(document);
 
     // 根据子命令决定运行模式
     match cli.command {
         Some(Commands::Web { port }) => {
-            tokio::runtime::Runtime::new()?.block_on(jkconfig::web::run_server(app_data, port))?;
+            tokio::runtime::Runtime::new()?.block_on(jkconfig::web::run_server(app_state, port))?;
         }
         Some(Commands::Tui) | None => {
             // 运行TUI界面（默认行为）
-            run_tui(app_data)?;
+            run_tui(app_state)?;
         }
     }
 
@@ -72,35 +72,8 @@ fn main() -> anyhow::Result<()> {
 }
 
 /// 运行TUI界面
-fn run_tui(app_data: AppData) -> anyhow::Result<()> {
-    let title = app_data.root.title.clone();
-    let fields = app_data.root.menu().fields();
-
-    cursive::logger::init();
-    cursive::logger::set_filter_levels_from_env();
-    // 创建Cursive应用
-    let mut siv = Cursive::default();
-
-    // 设置AppData为user_data
-    siv.set_user_data(app_data);
-
-    // 添加全局键盘事件处理
-    siv.add_global_callback('q', handle_quit);
-    siv.add_global_callback('Q', handle_quit);
-    siv.add_global_callback('s', handle_save);
-    siv.add_global_callback('S', handle_save);
-    siv.add_global_callback(Key::Esc, handle_back);
-    siv.add_global_callback('~', cursive::Cursive::toggle_debug_console);
-    // 初始菜单路径为空
-    siv.add_fullscreen_layer(menu_view(&title, "", fields));
-
-    // 运行应用
-    siv.run();
-
-    println!("Exiting jkconfig...");
-    let mut app = siv.take_user_data::<AppData>().unwrap();
-    println!("Data: \n{:#?}", app.root);
-    app.on_exit()?;
-
+fn run_tui(app_state: AppState) -> anyhow::Result<()> {
+    let mut app = launch_tui(app_state)?;
+    app.persist_if_needed()?;
     Ok(())
 }

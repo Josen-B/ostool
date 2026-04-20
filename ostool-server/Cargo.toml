@@ -1,0 +1,57 @@
+[package]
+authors = ["周睿 <zrufo747@outlook.com>"]
+build = "build.rs"
+categories = ["command-line-utilities", "embedded", "development-tools"]
+description = "Server for managing development boards, serial sessions, and TFTP artifacts"
+edition = "2024"
+keywords = ["embedded", "u-boot", "tftp", "serial", "server"]
+license = "MIT OR Apache-2.0"
+name = "ostool-server"
+readme = "README.md"
+repository = "https://github.com/drivercraft/ostool"
+version = "0.1.8"
+
+exclude = ["webui/node_modules/*", "webui/dist/*"]
+
+[package.metadata.binstall]
+bin-dir = "{ name }-{ version }-{ target }/{ bin }{ binary-ext }"
+pkg-fmt = "tgz"
+pkg-url = "{ repo }/releases/download/{ name }-v{ version }/{ name }-{ version }-{ target }.{ archive-format }"
+
+[[bin]]
+name = "ostool-server"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = {workspace = true}
+async-trait = "0.1"
+axum = {version = "0.8", features = ["ws"]}
+base64 = "0.22"
+chrono = {version = "0.4.44", features = ["serde"]}
+clap = {workspace = true, features = ["derive"]}
+env_logger = {workspace = true}
+futures-util = "0.3"
+log = {workspace = true}
+mime_guess = "2"
+network-interface = "2"
+nusb = "0.2.3"
+rust-embed = {version = "8", features = ["interpolate-folder-path", "debug-embed"]}
+schemars = {workspace = true, features = ["derive"]}
+serde = {workspace = true, features = ["derive"]}
+serde_json = {workspace = true}
+serialport = "4.6"
+tftpd = "0.5"
+thiserror = {workspace = true}
+tokio = {workspace = true, features = ["full"]}
+tokio-modbus = {version = "0.17.0", default-features = false, features = ["rtu"]}
+tokio-serial = "5.4"
+toml = {workspace = true}
+tower-http = {version = "0.6", features = ["fs"]}
+uuid = {version = "1", features = ["serde", "v4"]}
+
+[dev-dependencies]
+reqwest = {version = "0.13", features = ["json"]}
+tempfile = "3"
+tokio-modbus = {version = "0.17.0", default-features = false, features = ["rtu", "rtu-server"]}
+tokio-tungstenite = "0.28"
+tower = {version = "0.5", features = ["util"]}

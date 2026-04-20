@@ -42,7 +42,7 @@ ostool 采用 Rust 工作空间架构，包含以下核心模块：
 ### 技术栈
 
 - **Rust** - 核心开发语言，提供内存安全和性能
-- **Cursive** - 现代化 TUI 框架
+- **Ratatui** - 现代化 TUI 框架
 - **JSON Schema** - 配置验证和类型安全
 - **Tokio** - 异步运行时
 - **Serialport** - 串口通信
@@ -126,6 +126,15 @@ ostool run uboot
 
 # 指定 U-Boot 配置文件运行
 ostool run uboot --uboot-config my-uboot.toml
+
+# 配置远端开发板服务器
+ostool board config
+
+# 查看远端开发板类型
+ostool board ls
+
+# 在远端开发板上运行
+ostool board run
 ```
 
 > 交互退出：在串口终端（如 `ostool run uboot`）中，按下 `Ctrl+A` 后再按 `x`，工具会检测到该序列并优雅退出，不会将按键发送到目标设备。
@@ -258,6 +267,24 @@ fail_regex = ["Boot failed", "Error loading kernel"]
 serial = "${env:SERIAL_DEVICE:-/dev/ttyUSB0}"
 baud_rate = "${env:BAUD_RATE:-115200}"
 ```
+
+### Board 全局配置 (`~/.ostool/config.toml`)
+
+`ostool board` 系列命令默认读取用户级全局配置。首次执行相关命令时，如果该文件不存在，会自动创建默认配置：
+
+```toml
+[board]
+server_ip = "localhost"
+port = 2999
+```
+
+可以通过下面的命令打开 TUI 编辑器修改：
+
+```bash
+ostool board config
+```
+
+项目级 `.board.toml` 中的 `server` / `port` 仍可用于 `ostool board run`，其优先级低于命令行参数，高于全局配置。
 
 ## 🛠️ 子项目详解
 

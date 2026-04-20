@@ -38,6 +38,9 @@
 /// with custom options and target specifications.
 pub mod build;
 
+/// ostool-server board client and remote terminal integration.
+pub mod board;
+
 /// Application context and state management.
 pub mod ctx;
 
@@ -75,5 +78,4 @@ extern crate log;
 #[macro_use]
 extern crate anyhow;
 
-pub use jkconfig::cursive;
 pub use tool::{ManifestContext, Tool, ToolConfig, resolve_manifest_context};

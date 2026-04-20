@@ -7,6 +7,88 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.15.0](https://github.com/drivercraft/ostool/compare/ostool-v0.14.0...ostool-v0.15.0) - 2026-04-15
+
+### Fixed
+
+- *(uboot)* honor board timeout in serial interaction stage ([#88](https://github.com/drivercraft/ostool/pull/88))
+
+## [0.14.0](https://github.com/drivercraft/ostool/compare/ostool-v0.13.0...ostool-v0.14.0) - 2026-04-15
+
+### Other
+
+- *(ostool)* CargoRunnerKind and clean up cargo_run calls ([#87](https://github.com/drivercraft/ostool/pull/87))
+- *(ostool)* improve api ([#85](https://github.com/drivercraft/ostool/pull/85))
+
+## [0.13.0](https://github.com/drivercraft/ostool/compare/ostool-v0.12.4...ostool-v0.13.0) - 2026-04-14
+
+### Added
+
+- support forwarding uboot_cmd from board run config ([#83](https://github.com/drivercraft/ostool/pull/83))
+
+## [0.12.4](https://github.com/drivercraft/ostool/compare/ostool-v0.12.3...ostool-v0.12.4) - 2026-04-03
+
+### Added
+
+- enhance UI components and add board statistics in the management view
+- add apply_overrides method to BoardRunConfig and refactor board command handling
+
+## [0.12.3](https://github.com/drivercraft/ostool/compare/ostool-v0.12.2...ostool-v0.12.3) - 2026-04-03
+
+### Added
+
+- update schema handling to convert "oneOf" with const variants to Enum and add tests for log field validation
+- add validation for required fields before saving configuration
+
+### Other
+
+- improve formatting and readability in various modules
+- simplify element handling and improve hook naming consistency
+- Add theme support and refactor UI components
+- Refactor UI and Web Handlers
+
+## [0.12.2](https://github.com/drivercraft/ostool/compare/ostool-v0.12.1...ostool-v0.12.2) - 2026-04-02
+
+### Added
+
+- add board connect ([#76](https://github.com/drivercraft/ostool/pull/76))
+
+### Added
+
+- add `ostool board connect -b <board-type>` for lightweight interactive board shell access via `ostool-server`
+
+## [0.12.1](https://github.com/drivercraft/ostool/compare/ostool-v0.12.0...ostool-v0.12.1) - 2026-04-02
+
+### Added
+
+- enhance board configuration input handling and improve terminal interaction
+
+### Other
+
+- simplify default implementation for BoardGlobalConfigFile and improve code clarity
+- reorganize imports and improve code formatting in multiple files
+- Update dependencies and improve hash calculations
+- remove logging dependencies and related code from the project
+- update configuration handling in install script and remove default config writing from CLI
+
+## [0.12.0](https://github.com/drivercraft/ostool/compare/ostool-v0.11.2...ostool-v0.12.0) - 2026-04-02
+
+### Added
+
+- add remote support ([#67](https://github.com/drivercraft/ostool/pull/67))
+
+## [0.11.2](https://github.com/drivercraft/ostool/compare/ostool-v0.11.1...ostool-v0.11.2) - 2026-03-30
+
+### Fixed
+
+- fix uboot tftp_dir bootfile path ([#64](https://github.com/drivercraft/ostool/pull/64))
+
+## [0.11.1](https://github.com/ZR233/ostool/compare/ostool-v0.11.0...ostool-v0.11.1) - 2026-03-27
+
+### Added
+
+- 增加 U-Boot 运行时错误上下文信息，改进超时处理逻辑
+
 ## [0.11.0](https://github.com/drivercraft/ostool/compare/ostool-v0.10.1...ostool-v0.11.0) - 2026-03-26
 
 ### Added

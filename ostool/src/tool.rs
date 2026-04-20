@@ -1,13 +1,17 @@
-use std::{env::current_dir, ffi::OsStr, path::PathBuf, sync::Arc};
+use std::{
+    env::current_dir,
+    ffi::OsStr,
+    path::{Path, PathBuf},
+    process::Command,
+    sync::Arc,
+};
 
 use anyhow::{Context, anyhow, bail};
 use cargo_metadata::Metadata;
 use colored::Colorize;
-use cursive::Cursive;
-use jkconfig::{
-    ElemHock,
-    data::{app_data::AppData, item::ItemType, types::ElementType},
-    ui::components::editors::{show_feature_select, show_list_select},
+use jkconfig::data::{
+    ElementHook, HookContext, HookFlow, HookOption, MessageLevel, MultiSelectBinding,
+    MultiSelectSpec, SingleSelectBinding, SingleSelectSpec,
 };
 use object::Object;
 use tokio::fs;
@@ -74,12 +78,22 @@ impl Tool {
         &mut self.ctx
     }
 
+    pub fn set_build_config_path(&mut self, path: Option<PathBuf>) {
+        self.ctx.build_config_path = path;
+    }
+
     pub fn into_context(self) -> AppContext {
         self.ctx
     }
 
     pub(crate) fn debug_enabled(&self) -> bool {
         self.config.debug
+    }
+
+    pub(crate) fn sync_cargo_context(&mut self, cargo: &Cargo) {
+        self.ctx.build_config = Some(BuildConfig {
+            system: BuildSystem::Cargo(cargo.clone()),
+        });
     }
 
     pub(crate) fn manifest_dir(&self) -> &PathBuf {
@@ -114,7 +128,7 @@ impl Tool {
     }
 
     /// Executes a shell command in the current context.
-    pub fn shell_run_cmd(&self, cmd: &str) -> anyhow::Result<()> {
+    pub(crate) fn shell_run_cmd(&self, cmd: &str) -> anyhow::Result<()> {
         let mut command = match std::env::consts::OS {
             "windows" => {
                 let mut command = self.command("powershell");
@@ -139,7 +153,7 @@ impl Tool {
     }
 
     /// Creates a new command builder for the given program.
-    pub fn command(&self, program: &str) -> crate::utils::Command {
+    pub(crate) fn command(&self, program: &str) -> crate::utils::Command {
         let tool = self.clone();
         let mut command =
             crate::utils::Command::new(program, &self.manifest_dir, move |s| tool.replace_value(s));
@@ -184,7 +198,7 @@ impl Tool {
     }
 
     /// Sets the ELF artifact path and synchronizes derived runtime metadata.
-    pub async fn set_elf_artifact_path(&mut self, path: PathBuf) -> anyhow::Result<()> {
+    pub(crate) async fn set_elf_artifact_path(&mut self, path: PathBuf) -> anyhow::Result<()> {
         let path = path
             .canonicalize()
             .with_path("failed to canonicalize file", &path)?;
@@ -207,13 +221,23 @@ impl Tool {
         Ok(())
     }
 
-    /// Sets the ELF file path and detects its architecture.
-    pub async fn set_elf_path(&mut self, path: PathBuf) -> anyhow::Result<()> {
-        self.set_elf_artifact_path(path).await
+    /// Imports an ELF artifact, strips it to a runtime `.elf`, and optionally
+    /// materializes a `.bin` image.
+    pub async fn prepare_elf_artifact(
+        &mut self,
+        path: PathBuf,
+        to_bin: bool,
+    ) -> anyhow::Result<()> {
+        self.set_elf_artifact_path(path).await?;
+        self.objcopy_elf()?;
+        if to_bin {
+            self.objcopy_output_bin()?;
+        }
+        Ok(())
     }
 
     /// Strips debug symbols from the ELF file.
-    pub fn objcopy_elf(&mut self) -> anyhow::Result<PathBuf> {
+    pub(crate) fn objcopy_elf(&mut self) -> anyhow::Result<PathBuf> {
         let elf_path = self
             .ctx
             .artifacts
@@ -267,7 +291,7 @@ impl Tool {
     }
 
     /// Converts the ELF file to raw binary format.
-    pub fn objcopy_output_bin(&mut self) -> anyhow::Result<PathBuf> {
+    pub(crate) fn objcopy_output_bin(&mut self) -> anyhow::Result<PathBuf> {
         if let Some(bin) = &self.ctx.artifacts.bin {
             debug!("BIN file already exists: {:?}", bin);
             return Ok(bin.clone());
@@ -334,7 +358,7 @@ impl Tool {
     }
 
     /// Loads and prepares the build configuration.
-    pub async fn prepare_build_config(
+    pub(crate) async fn prepare_build_config(
         &mut self,
         config_path: Option<PathBuf>,
         menu: bool,
@@ -342,13 +366,10 @@ impl Tool {
         let config_path = self.resolve_build_config_path(config_path);
         self.ctx.build_config_path = Some(config_path.clone());
 
-        let Some(mut c): Option<BuildConfig> = jkconfig::run(
-            config_path.clone(),
-            menu,
-            &[self.ui_hock_feature_select(), self.ui_hock_pacage_select()],
-        )
-        .await
-        .with_context(|| format!("failed to load build config: {}", config_path.display()))?
+        let hooks = self.ui_hooks();
+        let Some(mut c): Option<BuildConfig> = jkconfig::run(config_path.clone(), menu, &hooks)
+            .await
+            .with_context(|| format!("failed to load build config: {}", config_path.display()))?
         else {
             bail!("No build configuration obtained");
         };
@@ -372,14 +393,7 @@ impl Tool {
         )
     }
 
-    pub fn value_replace_with_var<S>(&self, value: S) -> String
-    where
-        S: AsRef<OsStr>,
-    {
-        self.replace_value(value)
-    }
-
-    pub fn replace_value<S>(&self, value: S) -> String
+    pub(crate) fn replace_value<S>(&self, value: S) -> String
     where
         S: AsRef<OsStr>,
     {
@@ -387,7 +401,7 @@ impl Tool {
             .unwrap_or_else(|_| value.as_ref().to_string_lossy().into_owned())
     }
 
-    pub fn replace_string(&self, input: &str) -> anyhow::Result<String> {
+    pub(crate) fn replace_string(&self, input: &str) -> anyhow::Result<String> {
         let package_dir = self.package_root_for_variables()?;
         let workspace_dir = self.workspace_dir.display().to_string();
         let package_dir = package_dir.display().to_string();
@@ -405,7 +419,7 @@ impl Tool {
         })
     }
 
-    pub fn replace_path_variables(&self, path: PathBuf) -> anyhow::Result<PathBuf> {
+    pub(crate) fn replace_path_variables(&self, path: PathBuf) -> anyhow::Result<PathBuf> {
         Ok(PathBuf::from(self.replace_string(&path.to_string_lossy())?))
     }
 
@@ -420,37 +434,64 @@ impl Tool {
         Ok(self.manifest_dir.clone())
     }
 
-    pub fn ui_hocks(&self) -> Vec<ElemHock> {
-        vec![self.ui_hock_feature_select(), self.ui_hock_pacage_select()]
+    pub(crate) fn ui_hooks(&self) -> Vec<ElementHook> {
+        vec![
+            self.ui_hook_feature_select(),
+            self.ui_hook_package_select(),
+            self.ui_hook_target_select(),
+        ]
     }
 
-    fn ui_hock_feature_select(&self) -> ElemHock {
+    fn ui_hook_feature_select(&self) -> ElementHook {
         let path = "system.features";
         let cargo_toml = self.workspace_dir.join("Cargo.toml");
-        ElemHock {
-            path: path.to_string(),
-            callback: Arc::new(move |siv: &mut Cursive, _path: &str| {
-                let mut package = String::new();
-                if let Some(app) = siv.user_data::<AppData>()
-                    && let Some(pkg) = app.root.get_by_key("system.package")
-                    && let ElementType::Item(item) = pkg
-                    && let ItemType::String { value: Some(v), .. } = &item.item_type
-                {
-                    package = v.clone();
+        ElementHook {
+            path: path.into(),
+            callback: Arc::new(move |ctx: &mut HookContext<'_>, path| {
+                let package = ctx
+                    .get_string("system.package")?
+                    .unwrap_or_default()
+                    .trim()
+                    .to_string();
+                if package.is_empty() {
+                    ctx.show_message(
+                        jkconfig::data::MessageLevel::Warning,
+                        "Select a package before editing features.",
+                    );
+                    return Ok(HookFlow::Consumed);
                 }
 
-                show_feature_select(siv, &package, &cargo_toml, None);
+                let feature_options = collect_feature_options(&cargo_toml, &package, None)?;
+                let options = feature_options
+                    .into_iter()
+                    .map(|feature| HookOption::new(feature.clone(), feature))
+                    .collect();
+
+                ctx.present_multi_select(MultiSelectSpec {
+                    title: format!("Features for {package}"),
+                    help: Some(
+                        "Space toggle  Enter apply. Dependency features use dep_name/feature."
+                            .into(),
+                    ),
+                    options,
+                    selected: ctx.get_strings(path.clone())?,
+                    min_selected: None,
+                    max_selected: None,
+                    binding: MultiSelectBinding::SetStringArray { path: path.clone() },
+                })?;
+
+                Ok(HookFlow::Consumed)
             }),
         }
     }
 
-    fn ui_hock_pacage_select(&self) -> ElemHock {
+    fn ui_hook_package_select(&self) -> ElementHook {
         let path = "system.package";
         let cargo_toml = self.workspace_dir.join("Cargo.toml");
 
-        ElemHock {
-            path: path.to_string(),
-            callback: Arc::new(move |siv: &mut Cursive, path: &str| {
+        ElementHook {
+            path: path.into(),
+            callback: Arc::new(move |ctx: &mut HookContext<'_>, path| {
                 let mut items = Vec::new();
                 if let Ok(metadata) = cargo_metadata::MetadataCommand::new()
                     .manifest_path(&cargo_toml)
@@ -462,20 +503,326 @@ impl Tool {
                     }
                 }
 
-                show_list_select(siv, "Pacage", &items, path, on_package_selected);
+                let options = items
+                    .into_iter()
+                    .map(|item| HookOption::new(item.clone(), item))
+                    .collect();
+                ctx.present_single_select(SingleSelectSpec {
+                    title: "Select Package".into(),
+                    help: Some("Choose the Cargo package used by the build config.".into()),
+                    options,
+                    initial: ctx.get_string(path.clone())?,
+                    allow_clear: false,
+                    binding: SingleSelectBinding::SetString { path: path.clone() },
+                })?;
+                Ok(HookFlow::Consumed)
+            }),
+        }
+    }
+
+    fn ui_hook_target_select(&self) -> ElementHook {
+        let path = "system.target";
+        let cargo_toml = self.workspace_dir.join("Cargo.toml");
+
+        ElementHook {
+            path: path.into(),
+            callback: Arc::new(move |ctx: &mut HookContext<'_>, path| {
+                let package = ctx
+                    .get_string("system.package")?
+                    .unwrap_or_default()
+                    .trim()
+                    .to_string();
+                let current_target = ctx.get_string(path.clone())?;
+
+                let mut warnings = Vec::new();
+                let (options, help) = if package.is_empty() {
+                    fallback_rustup_targets()?
+                } else {
+                    match collect_package_doc_targets(&cargo_toml, &package) {
+                        Ok(Some(doc_targets)) => (
+                            build_target_options(TargetCandidateSet::DocsRs(&doc_targets)),
+                            "Select a target declared by the selected package docs.rs metadata."
+                                .to_string(),
+                        ),
+                        Ok(None) => fallback_rustup_targets()?,
+                        Err(err) => {
+                            warnings.push(format!(
+                                "Failed to inspect docs.rs targets for package '{package}': {err}"
+                            ));
+                            fallback_rustup_targets()?
+                        }
+                    }
+                };
+
+                if options.is_empty() {
+                    bail!("No target candidates available for selection");
+                }
+
+                for warning in warnings {
+                    ctx.show_message(MessageLevel::Warning, warning);
+                }
+
+                ctx.present_single_select(SingleSelectSpec {
+                    title: "Select Target".into(),
+                    help: Some(help),
+                    options,
+                    initial: current_target,
+                    allow_clear: false,
+                    binding: SingleSelectBinding::SetString { path: path.clone() },
+                })?;
+
+                Ok(HookFlow::Consumed)
             }),
         }
     }
 }
 
-fn on_package_selected(app: &mut AppData, path: &str, selected: &str) {
-    let ElementType::Item(item) = app.root.get_mut_by_key(path).unwrap() else {
-        panic!("Not an item element");
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RustupTargetOption {
+    triple: String,
+    installed: bool,
+}
+
+enum TargetCandidateSet<'a> {
+    DocsRs(&'a [String]),
+    Rustup(&'a [RustupTargetOption]),
+}
+
+fn fallback_rustup_targets() -> anyhow::Result<(Vec<HookOption>, String)> {
+    let rustup_targets = collect_rustup_targets()?;
+    if rustup_targets.is_empty() {
+        bail!("No Rust targets available from `rustup target list`");
+    }
+    Ok((
+        build_target_options(TargetCandidateSet::Rustup(&rustup_targets)),
+        "Package has no docs.rs targets; showing rustup targets.".to_string(),
+    ))
+}
+
+fn collect_feature_options(
+    manifest_path: &Path,
+    package_name: &str,
+    deps_filter: Option<&[String]>,
+) -> anyhow::Result<Vec<String>> {
+    let metadata = cargo_metadata::MetadataCommand::new()
+        .manifest_path(manifest_path)
+        .no_deps()
+        .exec()?;
+    let Some(pkg) = metadata
+        .packages
+        .iter()
+        .find(|pkg| pkg.name == package_name)
+    else {
+        bail!(
+            "package '{package_name}' not found in {}",
+            manifest_path.display()
+        );
     };
-    let ItemType::String { value, .. } = &mut item.item_type else {
-        panic!("Not a string item");
+
+    let mut features = pkg.features.keys().cloned().collect::<Vec<_>>();
+    features.sort();
+
+    for dependency in &pkg.dependencies {
+        let include = match deps_filter {
+            Some(filter) => filter.contains(&dependency.name),
+            None => true,
+        };
+        if !include {
+            continue;
+        }
+
+        let Some(dep_pkg) = metadata
+            .packages
+            .iter()
+            .find(|candidate| candidate.name == dependency.name)
+        else {
+            continue;
+        };
+        let mut dep_features = dep_pkg.features.keys().cloned().collect::<Vec<_>>();
+        dep_features.sort();
+        features.extend(
+            dep_features
+                .into_iter()
+                .map(|feature| format!("{}/{}", dependency.name, feature)),
+        );
+    }
+
+    Ok(features)
+}
+
+fn collect_package_doc_targets(
+    manifest_path: &Path,
+    package_name: &str,
+) -> anyhow::Result<Option<Vec<String>>> {
+    let metadata = cargo_metadata::MetadataCommand::new()
+        .manifest_path(manifest_path)
+        .no_deps()
+        .exec()
+        .with_context(|| {
+            format!(
+                "failed to load cargo metadata from {}",
+                manifest_path.display()
+            )
+        })?;
+    let Some(pkg) = metadata
+        .packages
+        .iter()
+        .find(|pkg| pkg.name == package_name)
+    else {
+        bail!(
+            "package '{package_name}' not found in {}",
+            manifest_path.display()
+        );
     };
-    *value = Some(selected.to_string());
+
+    parse_docs_rs_targets(&pkg.metadata)
+}
+
+fn parse_docs_rs_targets(metadata: &serde_json::Value) -> anyhow::Result<Option<Vec<String>>> {
+    let Some(docs) = metadata.get("docs") else {
+        return Ok(None);
+    };
+    let Some(docs_rs) = docs.get("rs") else {
+        return Ok(None);
+    };
+
+    let targets = match docs_rs.get("targets") {
+        Some(serde_json::Value::Array(values)) => {
+            let mut targets = Vec::with_capacity(values.len());
+            for value in values {
+                let target = value.as_str().ok_or_else(|| {
+                    anyhow!("package.metadata.docs.rs.targets must be an array of strings")
+                })?;
+                let target = target.trim();
+                if target.is_empty() {
+                    bail!("package.metadata.docs.rs.targets must not contain empty strings");
+                }
+                if !targets.iter().any(|existing| existing == target) {
+                    targets.push(target.to_string());
+                }
+            }
+            Some(targets)
+        }
+        Some(_) => bail!("package.metadata.docs.rs.targets must be an array of strings"),
+        None => None,
+    };
+
+    let default_target = match docs_rs.get("default-target") {
+        Some(serde_json::Value::String(value)) => {
+            let value = value.trim();
+            if value.is_empty() {
+                bail!("package.metadata.docs.rs.default-target must not be empty");
+            }
+            Some(value.to_string())
+        }
+        Some(_) => bail!("package.metadata.docs.rs.default-target must be a string"),
+        None => None,
+    };
+
+    let mut normalized = match targets {
+        Some(targets) if !targets.is_empty() => targets,
+        _ => Vec::new(),
+    };
+
+    if let Some(default_target) = default_target {
+        if let Some(index) = normalized
+            .iter()
+            .position(|target| target == &default_target)
+        {
+            let value = normalized.remove(index);
+            normalized.insert(0, value);
+        } else {
+            normalized.insert(0, default_target);
+        }
+    }
+
+    if normalized.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(normalized))
+    }
+}
+
+fn collect_rustup_targets() -> anyhow::Result<Vec<RustupTargetOption>> {
+    let output = Command::new("rustup")
+        .args(["target", "list"])
+        .output()
+        .context("failed to run `rustup target list`")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!(
+            "`rustup target list` failed with {}:\n{}",
+            output.status,
+            stderr.trim()
+        );
+    }
+
+    let stdout = String::from_utf8(output.stdout)
+        .context("`rustup target list` output is not valid UTF-8")?;
+    Ok(parse_rustup_targets(&stdout))
+}
+
+fn parse_rustup_targets(output: &str) -> Vec<RustupTargetOption> {
+    let mut installed = Vec::new();
+    let mut available = Vec::new();
+
+    for line in output
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+    {
+        let installed_flag = line.ends_with(" (installed)");
+        let triple = line
+            .strip_suffix(" (installed)")
+            .unwrap_or(line)
+            .trim()
+            .to_string();
+        if triple.is_empty() {
+            continue;
+        }
+
+        let option = RustupTargetOption {
+            triple,
+            installed: installed_flag,
+        };
+        if installed_flag {
+            installed.push(option);
+        } else {
+            available.push(option);
+        }
+    }
+
+    installed.extend(available);
+    installed
+}
+
+fn build_target_options(candidates: TargetCandidateSet<'_>) -> Vec<HookOption> {
+    match candidates {
+        TargetCandidateSet::DocsRs(targets) => targets
+            .iter()
+            .cloned()
+            .map(|target| HookOption {
+                value: target.clone(),
+                label: target,
+                detail: Some("docs.rs target".into()),
+                disabled: false,
+            })
+            .collect(),
+        TargetCandidateSet::Rustup(targets) => targets
+            .iter()
+            .map(|target| HookOption {
+                value: target.triple.clone(),
+                label: target.triple.clone(),
+                detail: Some(if target.installed {
+                    "installed".into()
+                } else {
+                    "available".into()
+                }),
+                disabled: false,
+            })
+            .collect(),
+    }
 }
 
 pub fn resolve_manifest_context(input: Option<PathBuf>) -> anyhow::Result<ManifestContext> {
@@ -533,11 +880,19 @@ fn resolve_manifest_path(input: Option<PathBuf>) -> anyhow::Result<PathBuf> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Tool, ToolConfig, resolve_manifest_context};
+    use super::{
+        Tool, ToolConfig, build_target_options, collect_package_doc_targets, parse_rustup_targets,
+        resolve_manifest_context,
+    };
     use crate::build::config::{BuildConfig, BuildSystem, Cargo};
     use crate::run::qemu::resolve_qemu_config_path_in_dir;
+    use jkconfig::data::ElementHook;
     use object::Architecture;
-    use std::collections::HashMap;
+    use std::{
+        collections::HashMap,
+        fs,
+        path::{Path, PathBuf},
+    };
 
     #[tokio::test]
     async fn set_elf_artifact_path_updates_dirs_and_arch() {
@@ -839,5 +1194,193 @@ mod tests {
             envs.iter()
                 .any(|(k, v)| k == "PKG_DIR" && v == &temp.path().display().to_string())
         );
+    }
+
+    #[test]
+    fn collect_package_doc_targets_uses_targets_list() {
+        let temp = tempfile::tempdir().unwrap();
+        let manifest = write_workspace_with_package(
+            temp.path(),
+            "kernel",
+            Some(
+                r#"[package.metadata.docs.rs]
+targets = ["riscv64gc-unknown-none-elf", "aarch64-unknown-none"]
+"#,
+            ),
+        );
+
+        let targets = collect_package_doc_targets(&manifest, "kernel")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            targets,
+            vec![
+                "riscv64gc-unknown-none-elf".to_string(),
+                "aarch64-unknown-none".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn collect_package_doc_targets_uses_default_target_when_targets_missing() {
+        let temp = tempfile::tempdir().unwrap();
+        let manifest = write_workspace_with_package(
+            temp.path(),
+            "kernel",
+            Some(
+                r#"[package.metadata.docs.rs]
+default-target = "aarch64-unknown-none"
+"#,
+            ),
+        );
+
+        let targets = collect_package_doc_targets(&manifest, "kernel")
+            .unwrap()
+            .unwrap();
+        assert_eq!(targets, vec!["aarch64-unknown-none".to_string()]);
+    }
+
+    #[test]
+    fn collect_package_doc_targets_moves_default_target_to_front() {
+        let temp = tempfile::tempdir().unwrap();
+        let manifest = write_workspace_with_package(
+            temp.path(),
+            "kernel",
+            Some(
+                r#"[package.metadata.docs.rs]
+targets = ["x86_64-unknown-none", "aarch64-unknown-none", "x86_64-unknown-none"]
+default-target = "aarch64-unknown-none"
+"#,
+            ),
+        );
+
+        let targets = collect_package_doc_targets(&manifest, "kernel")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            targets,
+            vec![
+                "aarch64-unknown-none".to_string(),
+                "x86_64-unknown-none".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn collect_package_doc_targets_rejects_invalid_docs_metadata() {
+        let temp = tempfile::tempdir().unwrap();
+        let manifest = write_workspace_with_package(
+            temp.path(),
+            "kernel",
+            Some(
+                r#"[package.metadata.docs.rs]
+targets = "aarch64-unknown-none"
+"#,
+            ),
+        );
+
+        let err = collect_package_doc_targets(&manifest, "kernel")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("targets"));
+        assert!(err.contains("array of strings"));
+    }
+
+    #[test]
+    fn collect_package_doc_targets_errors_for_missing_package() {
+        let temp = tempfile::tempdir().unwrap();
+        let manifest = write_workspace_with_package(temp.path(), "kernel", None);
+
+        let err = collect_package_doc_targets(&manifest, "missing")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("package 'missing' not found"));
+    }
+
+    #[test]
+    fn parse_rustup_targets_prioritizes_installed_entries() {
+        let parsed = parse_rustup_targets(
+            "aarch64-unknown-none\nx86_64-unknown-none (installed)\nriscv64gc-unknown-none-elf\nthumbv7em-none-eabihf (installed)\n",
+        );
+
+        let triples: Vec<_> = parsed.iter().map(|target| target.triple.as_str()).collect();
+        let installed: Vec<_> = parsed.iter().map(|target| target.installed).collect();
+        assert_eq!(
+            triples,
+            vec![
+                "x86_64-unknown-none",
+                "thumbv7em-none-eabihf",
+                "aarch64-unknown-none",
+                "riscv64gc-unknown-none-elf"
+            ]
+        );
+        assert_eq!(installed, vec![true, true, false, false]);
+    }
+
+    #[test]
+    fn parse_rustup_targets_handles_empty_output() {
+        let parsed = parse_rustup_targets("");
+        assert!(parsed.is_empty());
+    }
+
+    #[test]
+    fn build_target_options_marks_rustup_install_state() {
+        let options = build_target_options(super::TargetCandidateSet::Rustup(&[
+            super::RustupTargetOption {
+                triple: "x86_64-unknown-none".into(),
+                installed: true,
+            },
+            super::RustupTargetOption {
+                triple: "aarch64-unknown-none".into(),
+                installed: false,
+            },
+        ]));
+        assert_eq!(options[0].detail.as_deref(), Some("installed"));
+        assert_eq!(options[1].detail.as_deref(), Some("available"));
+    }
+
+    #[test]
+    fn ui_hooks_include_system_target_hook() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::write(
+            temp.path().join("Cargo.toml"),
+            "[package]\nname = \"sample\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+        )
+        .unwrap();
+        fs::create_dir_all(temp.path().join("src")).unwrap();
+        fs::write(temp.path().join("src/lib.rs"), "").unwrap();
+
+        let tool = Tool::new(ToolConfig {
+            manifest: Some(temp.path().to_path_buf()),
+            ..Default::default()
+        })
+        .unwrap();
+
+        let hooks: Vec<ElementHook> = tool.ui_hooks();
+        assert!(
+            hooks
+                .iter()
+                .any(|hook| hook.path.as_key() == "system.target")
+        );
+    }
+
+    fn write_workspace_with_package(root: &Path, package: &str, metadata: Option<&str>) -> PathBuf {
+        fs::write(
+            root.join("Cargo.toml"),
+            format!("[workspace]\nmembers = [\"{package}\"]\nresolver = \"3\"\n"),
+        )
+        .unwrap();
+
+        let package_dir = root.join(package);
+        fs::create_dir_all(package_dir.join("src")).unwrap();
+        let mut cargo_toml =
+            format!("[package]\nname = \"{package}\"\nversion = \"0.1.0\"\nedition = \"2024\"\n");
+        if let Some(metadata) = metadata {
+            cargo_toml.push('\n');
+            cargo_toml.push_str(metadata);
+        }
+        fs::write(package_dir.join("Cargo.toml"), cargo_toml).unwrap();
+        fs::write(package_dir.join("src/lib.rs"), "").unwrap();
+        root.join("Cargo.toml")
     }
 }
