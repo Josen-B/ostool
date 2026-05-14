@@ -26,6 +26,8 @@ use uefi::loaded_image::{LoaderError, loader_url_from_loaded_image};
 const DEVICE_PATH_BUFFER_SIZE: usize = 1024;
 #[cfg(target_os = "uefi")]
 const URL_BUFFER_SIZE: usize = 1024;
+#[cfg(target_os = "uefi")]
+const EMBEDDED_MANIFEST_URL_ENV: &str = "OSTOOL_HTTPBOOT_MANIFEST_URL";
 
 #[cfg(target_os = "uefi")]
 #[unsafe(no_mangle)]
@@ -73,6 +75,22 @@ pub extern "efiapi" fn efi_main(image: EfiHandle, system_table: *mut EfiSystemTa
         }
     }
 
+    if manifest_url.is_none() {
+        match embedded_manifest_url() {
+            Some(url) => {
+                write_console(console, "embedded_manifest_url: ");
+                write_console(console, url);
+                write_console(console, "\r\n");
+                manifest_url = Some(url);
+            }
+            None => {
+                write_console(console, "embedded_manifest_url_unset: ");
+                write_console(console, EMBEDDED_MANIFEST_URL_ENV);
+                write_console(console, "\r\n");
+            }
+        }
+    }
+
     write_console(
         console,
         "HTTP download backend is pending; manifest bytes parser linked\r\n",
@@ -80,6 +98,12 @@ pub extern "efiapi" fn efi_main(image: EfiHandle, system_table: *mut EfiSystemTa
     print_http_protocol_probe(console, image, system_table, manifest_url);
 
     EFI_SUCCESS
+}
+
+#[cfg(target_os = "uefi")]
+fn embedded_manifest_url() -> Option<&'static str> {
+    let url = option_env!("OSTOOL_HTTPBOOT_MANIFEST_URL")?.trim();
+    if url.is_empty() { None } else { Some(url) }
 }
 
 #[cfg(target_os = "uefi")]

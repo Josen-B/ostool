@@ -69,6 +69,9 @@ pub fn build_router(state: AppState) -> Router {
             "/boot/boards/{board_id}/current/{*path}",
             get(get_http_boot_file),
         )
+        .route("/B.EFI", get(get_http_boot_short_loader))
+        .route("/manifest.json", get(get_http_boot_short_manifest))
+        .route("/kernel.bin", get(get_http_boot_short_kernel))
         .route("/api/v1/admin/overview", get(get_admin_overview))
         .route("/api/v1/admin/boards", get(list_boards).post(create_board))
         .route("/api/v1/admin/dtbs", get(list_dtbs).post(create_dtb))
@@ -1118,6 +1121,26 @@ async fn get_http_boot_file(
     State(state): State<AppState>,
 ) -> Result<Response, ApiError> {
     let relative_path = parse_relative_path(&path)?;
+    read_http_boot_current_file(&state, &board_id, &relative_path).await
+}
+
+async fn get_http_boot_short_loader(State(state): State<AppState>) -> Result<Response, ApiError> {
+    read_http_boot_current_file(&state, "l", "BOOTLOONGARCH64.EFI").await
+}
+
+async fn get_http_boot_short_manifest(State(state): State<AppState>) -> Result<Response, ApiError> {
+    read_http_boot_current_file(&state, "l", "manifest.json").await
+}
+
+async fn get_http_boot_short_kernel(State(state): State<AppState>) -> Result<Response, ApiError> {
+    read_http_boot_current_file(&state, "l", "kernel.bin").await
+}
+
+async fn read_http_boot_current_file(
+    state: &AppState,
+    board_id: &str,
+    relative_path: &str,
+) -> Result<Response, ApiError> {
     let config = state.config.read().await.clone();
     if !config.http_boot.enabled {
         return Err(ApiError::not_found("HTTP Boot is disabled"));
