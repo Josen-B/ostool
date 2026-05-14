@@ -23,7 +23,9 @@ all: $(TARGET)
 $(OUT_DIR):
 	mkdir -p $@
 
-$(ELF): src/main.rs loader.lds | $(OUT_DIR)
+RUST_SRCS := $(wildcard src/*.rs)
+
+$(ELF): $(RUST_SRCS) loader.lds | $(OUT_DIR)
 	OSTOOL_MANIFEST_URL="$(MANIFEST_URL)" \
 	OSTOOL_ENABLE_BOOT_JUMP="$(ENABLE_BOOT_JUMP)" \
 	$(RUSTC) --edition=2024 \
