@@ -271,7 +271,11 @@ fn tcp4_receive_once(
     };
     write_prefixed_status(label, "_rx_completion", completion);
     write_prefixed_status(label, "_rx_token_status", token.completion_token.status);
-    *received_len = rx_data.data_length as usize;
+    if completion.is_error() {
+        *received_len = 0;
+    } else {
+        *received_len = rx_data.data_length as usize;
+    }
     write_ascii(label);
     write_ascii("_rx_len: ");
     write_dec(*received_len as u64);
@@ -294,6 +298,140 @@ fn tcp4_receive_once(
         ((*bs).close_event)(event);
     }
     completion
+}
+
+fn print_tcp4_first5(label: &str, suffix: &str, bytes: &[u8], len: usize) {
+    if len < 5 {
+        return;
+    }
+    write_ascii(label);
+    write_ascii(suffix);
+    let mut i = 0usize;
+    while i < 5 {
+        write_ascii("0x");
+        write_hex64(bytes[i] as u64);
+        if i + 1 < 5 {
+            write_ascii(",");
+        }
+        i += 1;
+    }
+    write_ascii("\r\n");
+}
+
+fn tls_session_state(tls: *mut EfiTlsProtocol, label: &str) -> u32 {
+    let mut state = 0u32;
+    let mut state_len = core::mem::size_of::<u32>();
+    let status = unsafe {
+        ((*tls).get_session_data)(
+            tls,
+            EFI_TLS_SESSION_DATA_TYPE_SESSION_STATE,
+            &mut state as *mut u32 as *mut c_void,
+            &mut state_len,
+        )
+    };
+    write_ascii(label);
+    write_ascii("_state_status: ");
+    write_ascii("0x");
+    write_hex64(status.0);
+    write_ascii("\r\n");
+    write_ascii(label);
+    write_ascii("_state: ");
+    write_dec(state as u64);
+    write_ascii("\r\n");
+    state
+}
+
+fn tcp4_transmit_with_pre_receive(
+    bs: *mut EfiBootServices,
+    tcp4: *mut EfiTcp4Protocol,
+    bytes: &mut [u8],
+    out: &mut [u8],
+    received_len: &mut usize,
+    label: &str,
+) -> EfiStatus {
+    *received_len = 0;
+
+    let mut rx_event = null_mut();
+    let rx_event_status = unsafe {
+        ((*bs).create_event)(
+            EVT_NOTIFY_SIGNAL,
+            TPL_CALLBACK,
+            Some(noop_event),
+            null_mut(),
+            &mut rx_event,
+        )
+    };
+    write_prefixed_status(label, "_pre_rx_event_status", rx_event_status);
+
+    let mut rx_data = EfiTcp4ReceiveData {
+        urgent_flag: 0,
+        data_length: out.len() as u32,
+        fragment_count: 1,
+        fragment_table: [EfiTcp4FragmentData {
+            fragment_length: out.len() as u32,
+            fragment_buffer: out.as_mut_ptr() as *mut c_void,
+        }],
+    };
+    let mut rx_token = EfiTcp4IoToken {
+        completion_token: EfiTcp4CompletionToken {
+            event: rx_event,
+            status: EFI_NOT_READY,
+        },
+        packet: EfiTcp4IoPacket {
+            rx_data: &mut rx_data,
+        },
+    };
+    let pre_rx_submit_status = if rx_event_status.is_error() {
+        rx_event_status
+    } else {
+        unsafe { ((*tcp4).receive)(tcp4, &mut rx_token) }
+    };
+    write_prefixed_status(label, "_pre_rx_submit_status", pre_rx_submit_status);
+
+    let tx_status = tcp4_transmit_once(bs, tcp4, bytes, label);
+    if !tx_status.is_error() {
+        unsafe {
+            if let Some(stall) = (*bs).stall {
+                stall(1_000_000);
+            }
+        }
+        let mut warm_poll = EFI_NOT_READY;
+        let mut i = 0usize;
+        while i < 200 {
+            warm_poll = unsafe { ((*tcp4).poll)(tcp4) };
+            i += 1;
+        }
+        write_prefixed_status(label, "_post_tx_poll_status", warm_poll);
+    }
+
+    let rx_status = if tx_status.is_error() {
+        tx_status
+    } else if !pre_rx_submit_status.is_error() {
+        let completion = poll_tcp4(tcp4, &rx_token.completion_token);
+        write_prefixed_status(label, "_pre_rx_completion", completion);
+        write_prefixed_status(label, "_pre_rx_token_status", rx_token.completion_token.status);
+        if completion.is_error() {
+            *received_len = 0;
+        } else {
+            *received_len = rx_data.data_length as usize;
+        }
+        write_ascii(label);
+        write_ascii("_pre_rx_len: ");
+        write_dec(*received_len as u64);
+        write_ascii("\r\n");
+        print_tcp4_first5(label, "_pre_rx_first5: ", out, *received_len);
+        completion
+    } else {
+        tcp4_receive_once(bs, tcp4, out, received_len, label)
+    };
+
+    unsafe {
+        if !rx_event.is_null() {
+            ((*bs).close_event)(rx_event);
+        }
+    }
+
+    rx_status
 }
 
 fn tcp4_tls_clienthello_probe(bs: *mut EfiBootServices) -> EfiStatus {
@@ -446,7 +584,7 @@ fn tcp4_tls_clienthello_probe(bs: *mut EfiBootServices) -> EfiStatus {
             subnet_mask: [0; 4],
             station_port: 0,
             remote_address: [10, 3, 10, 229],
-            remote_port: 3443,
+            remote_port: 443,
             active_flag: 1,
         },
         control_option: EfiTcp4Option {
@@ -529,19 +667,85 @@ fn tcp4_tls_clienthello_probe(bs: *mut EfiBootServices) -> EfiStatus {
         return connect_status;
     }
 
-    let tx_status = tcp4_transmit_once(
+    let tls = match open_protocol::<EfiTlsProtocol>(bs, tls_child, &EFI_TLS_PROTOCOL_GUID) {
+        Ok(tls) => {
+            write_status("tcp4_tls_probe_tls_protocol_reopen_status: ", EFI_SUCCESS);
+            tls
+        }
+        Err(status) => {
+            write_status("tcp4_tls_probe_tls_protocol_reopen_status: ", status);
+            unsafe {
+                ((*tcp4).configure)(tcp4, null_mut());
+                ((*tcp_binding).destroy_child)(tcp_binding, tcp_child);
+                ((*bs).free_pool)(tcp_service_handles as *mut c_void);
+                ((*tls_binding).destroy_child)(tls_binding, tls_child);
+                ((*bs).free_pool)(tls_service_handles as *mut c_void);
+            }
+            return status;
+        }
+    };
+    tls_session_state(tls, "tcp4_tls_probe_tls_initial");
+
+    let mut rx = [0u8; 8192];
+    let mut rx_len = 0usize;
+    let mut rx_status = tcp4_transmit_with_pre_receive(
         bs,
         tcp4,
         &mut clienthello[..clienthello_len],
+        &mut rx,
+        &mut rx_len,
         "tcp4_tls_probe",
     );
-    let mut rx = [0u8; 2048];
-    let mut rx_len = 0usize;
-    let rx_status = if tx_status.is_error() {
-        tx_status
-    } else {
-        tcp4_receive_once(bs, tcp4, &mut rx, &mut rx_len, "tcp4_tls_probe")
-    };
+
+    let mut tls_out = [0u8; 8192];
+    let mut round = 0usize;
+    while !rx_status.is_error() && round < 4 {
+        let label = match round {
+            0 => "tcp4_tls_probe_hs0",
+            1 => "tcp4_tls_probe_hs1",
+            2 => "tcp4_tls_probe_hs2",
+            _ => "tcp4_tls_probe_hs3",
+        };
+
+        tls_session_state(tls, label);
+        let mut tls_out_len = tls_out.len();
+        let build_status = unsafe {
+            ((*tls).build_response_packet)(
+                tls,
+                rx.as_mut_ptr(),
+                rx_len,
+                tls_out.as_mut_ptr(),
+                &mut tls_out_len,
+            )
+        };
+        write_prefixed_status(label, "_build_response_status", build_status);
+        write_ascii(label);
+        write_ascii("_build_response_len: ");
+        write_dec(tls_out_len as u64);
+        write_ascii("\r\n");
+        print_tcp4_first5(label, "_build_response_first5: ", &tls_out, tls_out_len);
+        let state = tls_session_state(tls, label);
+        if build_status.is_error() {
+            rx_status = build_status;
+            break;
+        }
+        if state == EFI_TLS_SESSION_DATA_TRANSFERRING {
+            break;
+        }
+        if tls_out_len == 0 || tls_out_len > tls_out.len() {
+            rx_status = EFI_NOT_READY;
+            break;
+        }
+        rx_status = tcp4_transmit_with_pre_receive(
+            bs,
+            tcp4,
+            &mut tls_out[..tls_out_len],
+            &mut rx,
+            &mut rx_len,
+            label,
+        );
+        round += 1;
+    }
     write_status("tcp4_tls_probe_result: ", rx_status);
 
     unsafe {

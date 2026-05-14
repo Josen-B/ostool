@@ -36,14 +36,16 @@ const KERNEL_CHUNK: usize = 16 * 1024;
 const MAX_KERNEL_SIZE: u64 = 256 * 1024 * 1024;
 const MEMORY_MAP_MAX: usize = 64 * 1024;
 const HTTP_POLL_LIMIT: usize = 1_000_000;
-const TCP4_POLL_LIMIT: usize = 2_000_000;
+const TCP4_POLL_LIMIT: usize = 5_000_000;
 
 const EFI_TLS_CONFIG_DATA_TYPE_CA_CERTIFICATE: u32 = 2;
 const EFI_TLS_SESSION_DATA_TYPE_VERSION: u32 = 0;
 const EFI_TLS_SESSION_DATA_TYPE_CONNECTION_END: u32 = 1;
 const EFI_TLS_SESSION_DATA_TYPE_VERIFY_METHOD: u32 = 5;
+const EFI_TLS_SESSION_DATA_TYPE_SESSION_STATE: u32 = 7;
 const EFI_TLS_CONNECTION_END_CLIENT: u32 = 0;
 const EFI_TLS_VERIFY_NONE: u32 = 0;
+const EFI_TLS_SESSION_DATA_TRANSFERRING: u32 = 2;
 const VERBOSE_SETUP_LOGS: bool = false;
 
 #[repr(C)]
@@ -253,7 +255,18 @@ struct EfiTlsProtocol {
     get_session_data: extern "C" fn(*mut EfiTlsProtocol, u32, *mut c_void, *mut usize) -> EfiStatus,
     build_response_packet:
         extern "C" fn(*mut EfiTlsProtocol, *mut u8, usize, *mut u8, *mut usize) -> EfiStatus,
-    process_packet: usize,
+    process_packet: extern "C" fn(
+        *mut EfiTlsProtocol,
+        *mut *mut EfiTlsFragmentData,
+        *mut u32,
+        u32,
+    ) -> EfiStatus,
+}
+
+#[repr(C)]
+struct EfiTlsFragmentData {
+    fragment_length: u32,
+    fragment_buffer: *mut c_void,
 }
 
 #[repr(C)]
