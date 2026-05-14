@@ -341,6 +341,117 @@ fn tls_session_state(tls: *mut EfiTlsProtocol, label: &str) -> u32 {
     state
 }
 
+fn print_ascii_prefix(label: &str, bytes: &[u8], len: usize) {
+    let mut count = len;
+    if count > 64 {
+        count = 64;
+    }
+    write_ascii(label);
+    write_ascii("_ascii_prefix: ");
+    let mut i = 0usize;
+    while i < count {
+        let b = bytes[i];
+        if b == b'\r' {
+            write_ascii("\\r");
+        } else if b == b'\n' {
+            write_ascii("\\n");
+        } else if b >= 0x20 && b < 0x7f {
+            write_bytes(&[b]);
+        } else {
+            write_ascii(".");
+        }
+        i += 1;
+    }
+    write_ascii("\r\n");
+}
+
+fn build_tls_plaintext_record(out: &mut [u8], payload: &[u8]) -> usize {
+    if out.len() < payload.len() + 5 || payload.len() > 0xffff {
+        return 0;
+    }
+    out[0] = 23;
+    out[1] = 3;
+    out[2] = 3;
+    // UEFI TLS ProcessPacket(EfiTlsEncrypt) consumes TLS_RECORD_HEADER as a
+    // firmware struct, so the plaintext input Length field is host-endian.
+    out[3] = (payload.len() & 0xff) as u8;
+    out[4] = ((payload.len() >> 8) & 0xff) as u8;
+    let mut i = 0usize;
+    while i < payload.len() {
+        out[5 + i] = payload[i];
+        i += 1;
+    }
+    payload.len() + 5
+}
+
+fn tls_record_total_len(bytes: &[u8], len: usize) -> usize {
+    if len < 5 {
+        return len;
+    }
+    let payload_len = ((bytes[3] as usize) << 8) | bytes[4] as usize;
+    let total_len = payload_len + 5;
+    if total_len <= len {
+        total_len
+    } else {
+        len
+    }
+}
+
+fn tls_process_single_fragment(
+    tls: *mut EfiTlsProtocol,
+    bytes: &mut [u8],
+    len: usize,
+    process_type: u32,
+    label: &str,
+) -> (EfiStatus, usize, *mut c_void) {
+    let mut fragment = EfiTlsFragmentData {
+        fragment_length: len as u32,
+        fragment_buffer: bytes.as_mut_ptr() as *mut c_void,
+    };
+    let mut fragment_ptr = &mut fragment as *mut EfiTlsFragmentData;
+    let mut fragment_count = 1u32;
+    let status = unsafe {
+        ((*tls).process_packet)(tls, &mut fragment_ptr, &mut fragment_count, process_type)
+    };
+    write_prefixed_status(label, "_process_status", status);
+    write_ascii(label);
+    write_ascii("_process_fragment_count: ");
+    write_dec(fragment_count as u64);
+    write_ascii("\r\n");
+    let fragment_len = if status.is_error() || fragment_ptr.is_null() {
+        0
+    } else {
+        unsafe { (*fragment_ptr).fragment_length as usize }
+    };
+    write_ascii(label);
+    write_ascii("_process_len: ");
+    write_dec(fragment_len as u64);
+    write_ascii("\r\n");
+    let fragment_buffer = if status.is_error() || fragment_ptr.is_null() {
+        null_mut()
+    } else {
+        unsafe { (*fragment_ptr).fragment_buffer }
+    };
+    (status, fragment_len, fragment_buffer)
+}
+
+fn copy_from_ptr(out: &mut [u8], src: *mut c_void, len: usize) -> usize {
+    if src.is_null() {
+        return 0;
+    }
+    let mut count = len;
+    if count > out.len() {
+        count = out.len();
+    }
+    let bytes = src as *const u8;
+    let mut i = 0usize;
+    while i < count {
+        out[i] = unsafe { read_volatile(bytes.add(i)) };
+        i += 1;
+    }
+    count
+}
+
 fn tcp4_transmit_with_pre_receive(
     bs: *mut EfiBootServices,
     tcp4: *mut EfiTcp4Protocol,
@@ -745,6 +856,71 @@ fn tcp4_tls_clienthello_probe(bs: *mut EfiBootServices) -> EfiStatus {
             label,
         );
         round += 1;
+    }
+    let final_state = tls_session_state(tls, "tcp4_tls_probe_tls_final");
+    if !rx_status.is_error() && final_state == EFI_TLS_SESSION_DATA_TRANSFERRING {
+        let http_get = b"GET /boot/boards/loongchip-httpboot-smoke/current/manifest.json HTTP/1.0\r\nHost: 10.3.10.229\r\nConnection: close\r\n\r\n";
+        let mut plain_record = [0u8; 1024];
+        let plain_record_len = build_tls_plaintext_record(&mut plain_record, http_get);
+        write_ascii("tcp4_tls_probe_app_plain_record_len: ");
+        write_dec(plain_record_len as u64);
+        write_ascii("\r\n");
+        if plain_record_len == 0 {
+            rx_status = EFI_BUFFER_TOO_SMALL;
+        } else {
+            let (encrypt_status, encrypted_len, encrypted_ptr) = tls_process_single_fragment(
+                tls,
+                &mut plain_record,
+                plain_record_len,
+                EFI_TLS_ENCRYPT,
+                "tcp4_tls_probe_app_encrypt",
+            );
+            rx_status = encrypt_status;
+            if !rx_status.is_error() && encrypted_len > 0 {
+                let mut encrypted = [0u8; 2048];
+                let encrypted_len = copy_from_ptr(&mut encrypted, encrypted_ptr, encrypted_len);
+                let encrypted_wire_len = tls_record_total_len(&encrypted, encrypted_len);
+                write_ascii("tcp4_tls_probe_app_encrypt_wire_len: ");
+                write_dec(encrypted_wire_len as u64);
+                write_ascii("\r\n");
+                print_tcp4_first5(
+                    "tcp4_tls_probe_app_encrypt",
+                    "_first5: ",
+                    &encrypted,
+                    encrypted_wire_len,
+                );
+                let mut encrypted_rx = [0u8; 8192];
+                let mut encrypted_rx_len = 0usize;
+                rx_status = tcp4_transmit_with_pre_receive(
+                    bs,
+                    tcp4,
+                    &mut encrypted[..encrypted_wire_len],
+                    &mut encrypted_rx,
+                    &mut encrypted_rx_len,
+                    "tcp4_tls_probe_app",
+                );
+                if !rx_status.is_error() {
+                    let (decrypt_status, decrypted_len, decrypted_ptr) =
+                        tls_process_single_fragment(
+                            tls,
+                            &mut encrypted_rx,
+                            encrypted_rx_len,
+                            EFI_TLS_DECRYPT,
+                            "tcp4_tls_probe_app_decrypt",
+                        );
+                    rx_status = decrypt_status;
+                    if !rx_status.is_error() && decrypted_len > 0 {
+                        let mut decrypted = [0u8; 512];
+                        let decrypted_len = copy_from_ptr(&mut decrypted, decrypted_ptr, decrypted_len);
+                        print_ascii_prefix(
+                            "tcp4_tls_probe_app_decrypt",
+                            &decrypted,
+                            decrypted_len,
+                        );
+                    }
+                }
+            }
+        }
     }
     write_status("tcp4_tls_probe_result: ", rx_status);
 
