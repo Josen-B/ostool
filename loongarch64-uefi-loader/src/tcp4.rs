@@ -789,6 +789,9 @@ fn https_get_manifest_probe(
                         write_ascii("tcp4_tls_probe_manifest_kernel_size: ");
                         write_dec(manifest.kernel_size);
                         write_ascii("\r\n");
+                        write_ascii("tcp4_tls_probe_manifest_kernel_load_addr: 0x");
+                        write_hex64(manifest.kernel_load_addr);
+                        write_ascii("\r\n");
                         write_ascii("tcp4_tls_probe_manifest_entry_point: 0x");
                         write_hex64(manifest.entry_point);
                         write_ascii("\r\n");
@@ -826,6 +829,7 @@ fn https_download_kernel_probe(
     tcp4: *mut EfiTcp4Protocol,
     tls: *mut EfiTlsProtocol,
     manifest: &Manifest,
+    loaded_at_manifest_addr: &mut bool,
 ) -> EfiStatus {
     if manifest.kernel_size == 0 || manifest.kernel_size > MAX_KERNEL_SIZE {
         return EFI_UNSUPPORTED;
@@ -852,22 +856,52 @@ fn https_download_kernel_probe(
     write_hex64(target);
     write_ascii("\r\n");
     if allocate_status.is_error() || target != manifest.kernel_load_addr {
-        write_ascii("tcp4_tls_probe_kernel_staging_fallback: yes\r\n");
-        target = 0;
-        allocate_status = unsafe {
-            ((*bs).allocate_pages)(EFI_ALLOCATE_ANY_PAGES, EFI_LOADER_DATA, pages, &mut target)
-        };
-        write_status(
-            "tcp4_tls_probe_kernel_staging_allocate_pages_status: ",
-            allocate_status,
+        let target_is_loader_data = target_range_has_memory_type(
+            bs,
+            manifest.kernel_load_addr,
+            manifest.kernel_size,
+            EFI_LOADER_DATA,
         );
-        write_ascii("tcp4_tls_probe_kernel_staging_addr: 0x");
-        write_hex64(target);
-        write_ascii("\r\n");
-        if allocate_status.is_error() {
-            return allocate_status;
+        write_ascii("tcp4_tls_probe_kernel_target_loader_data_after_allocate: ");
+        write_ascii(if target_is_loader_data {
+            "yes\r\n"
+        } else {
+            "no\r\n"
+        });
+        if target == manifest.kernel_load_addr && target_is_loader_data {
+            write_ascii("tcp4_tls_probe_kernel_allocate_error_accepted: yes\r\n");
+            *loaded_at_manifest_addr = true;
+        } else {
+            *loaded_at_manifest_addr = false;
+            write_ascii("tcp4_tls_probe_kernel_staging_fallback: yes\r\n");
+            target = 0;
+            allocate_status = unsafe {
+                ((*bs).allocate_pages)(EFI_ALLOCATE_ANY_PAGES, EFI_LOADER_DATA, pages, &mut target)
+            };
+            write_status(
+                "tcp4_tls_probe_kernel_staging_allocate_pages_status: ",
+                allocate_status,
+            );
+            write_ascii("tcp4_tls_probe_kernel_staging_addr: 0x");
+            write_hex64(target);
+            write_ascii("\r\n");
+            if allocate_status.is_error() {
+                return allocate_status;
+            }
+            *loaded_at_manifest_addr = target == manifest.kernel_load_addr;
         }
+    } else {
+        *loaded_at_manifest_addr = true;
     }
+    write_ascii("tcp4_tls_probe_kernel_final_load_addr: 0x");
+    write_hex64(target);
+    write_ascii("\r\n");
+    write_ascii("tcp4_tls_probe_kernel_final_load_addr_ready: ");
+    write_ascii(if *loaded_at_manifest_addr {
+        "yes\r\n"
+    } else {
+        "no\r\n"
+    });
 
     let mut http_get = [0u8; 1536];
     let http_get_len = match build_http_get_request(kernel_path, b"close", &mut http_get) {
@@ -1325,7 +1359,7 @@ fn tcp4_transmit_with_pre_receive(
     rx_status
 }
 
-fn tcp4_tls_clienthello_probe(bs: *mut EfiBootServices) -> EfiStatus {
+fn tcp4_tls_clienthello_probe(image: EfiHandle, bs: *mut EfiBootServices) -> EfiStatus {
     write_ascii("tcp4_tls_probe_start\r\n");
 
     let mut tls_service_count = 0usize;
@@ -1642,7 +1676,8 @@ fn tcp4_tls_clienthello_probe(bs: *mut EfiBootServices) -> EfiStatus {
         write_ascii("tcp4_tls_probe_next_kernel_size: ");
         write_dec(manifest.kernel_size);
         write_ascii("\r\n");
-        rx_status = https_download_kernel_probe(bs, tcp4, tls, &manifest);
+        let mut loaded_at_manifest_addr = false;
+        rx_status = https_download_kernel_probe(bs, tcp4, tls, &manifest, &mut loaded_at_manifest_addr);
         write_status("tcp4_tls_probe_kernel_download_status: ", rx_status);
         if !rx_status.is_error() {
             let mut map_key = 0usize;
@@ -1653,8 +1688,24 @@ fn tcp4_tls_clienthello_probe(bs: *mut EfiBootServices) -> EfiStatus {
             } else {
                 "no\r\n"
             });
-            if !OSTOOL_ENABLE_BOOT_JUMP || status.is_error() {
+            write_ascii("boot_jump_load_address_ready: ");
+            write_ascii(if loaded_at_manifest_addr {
+                "yes\r\n"
+            } else {
+                "no\r\n"
+            });
+            if !loaded_at_manifest_addr {
+                print_target_memory_map_probe(bs, manifest.kernel_load_addr, manifest.kernel_size);
+                write_ascii("jump_skipped: kernel is in staging buffer\r\n");
+            } else if !OSTOOL_ENABLE_BOOT_JUMP || status.is_error() {
                 write_ascii("jump_skipped: boot jump disabled\r\n");
+            } else {
+                let exit_status = unsafe { ((*bs).exit_boot_services)(image, map_key) };
+                if !exit_status.is_error() {
+                    call_kernel(manifest.entry_point);
+                }
+                write_status("exit_boot_services_status: ", exit_status);
+                write_ascii("jump_failed\r\n");
             }
         }
     }

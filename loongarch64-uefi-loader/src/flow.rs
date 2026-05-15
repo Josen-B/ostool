@@ -88,6 +88,9 @@ extern "C" fn efi_main(image: EfiHandle, system_table: *mut EfiSystemTable) -> E
     write_ascii("manifest_url: ");
     write_ascii(OSTOOL_MANIFEST_URL);
     write_ascii("\r\n");
+    write_ascii("loader_build_id: ");
+    write_ascii(OSTOOL_LOONGARCH64_LOADER_BUILD_ID);
+    write_ascii("\r\n");
     write_ascii("log_mode: summary\r\n");
 
     let bs = unsafe {
@@ -113,7 +116,10 @@ extern "C" fn efi_main(image: EfiHandle, system_table: *mut EfiSystemTable) -> E
     configure_tls_ca(bs);
     run_tcp4_probe(bs);
     run_tls_clienthello_probe(bs);
-    tcp4_tls_clienthello_probe(bs);
+    let tcp4_tls_status = tcp4_tls_clienthello_probe(image, bs);
+    if !tcp4_tls_status.is_error() {
+        return EFI_SUCCESS;
+    }
 
     let mut service_count = 0usize;
     let mut service_handles = null_mut();

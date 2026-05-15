@@ -116,6 +116,160 @@ fn print_memory_map(bs: *mut EfiBootServices, map_key_out: &mut usize) -> EfiSta
     write_ascii("\r\n");
     status
 }
+
+fn print_memory_descriptor(label: &str, descriptor: *const EfiMemoryDescriptor) {
+    if descriptor.is_null() {
+        write_ascii(label);
+        write_ascii("_found: no\r\n");
+        return;
+    }
+
+    let desc = unsafe { &*descriptor };
+    write_ascii(label);
+    write_ascii("_found: yes\r\n");
+    write_ascii(label);
+    write_ascii("_type: ");
+    write_dec(desc.memory_type as u64);
+    write_ascii("\r\n");
+    write_ascii(label);
+    write_ascii("_physical_start: 0x");
+    write_hex64(desc.physical_start);
+    write_ascii("\r\n");
+    write_ascii(label);
+    write_ascii("_pages: ");
+    write_dec(desc.number_of_pages);
+    write_ascii("\r\n");
+    write_ascii(label);
+    write_ascii("_physical_end: 0x");
+    write_hex64(desc.physical_start + desc.number_of_pages * EFI_PAGE_SIZE as u64);
+    write_ascii("\r\n");
+}
+
+fn memory_descriptor_contains(desc: &EfiMemoryDescriptor, address: u64) -> bool {
+    let start = desc.physical_start;
+    let end = start + desc.number_of_pages * EFI_PAGE_SIZE as u64;
+    start <= address && address < end
+}
+
+fn memory_descriptor_contains_range(desc: &EfiMemoryDescriptor, target: u64, size: u64) -> bool {
+    if size == 0 {
+        return false;
+    }
+    let start = desc.physical_start;
+    let end = start + desc.number_of_pages * EFI_PAGE_SIZE as u64;
+    let target_end = target + size;
+    start <= target && target_end <= end
+}
+
+fn target_range_has_memory_type(
+    bs: *mut EfiBootServices,
+    target: u64,
+    size: u64,
+    memory_type: EfiMemoryType,
+) -> bool {
+    let mut map_size = MEMORY_MAP_MAX;
+    let mut map_key = 0usize;
+    let mut descriptor_size = 0usize;
+    let mut descriptor_version = 0u32;
+    let memory_map = core::ptr::addr_of_mut!(MEMORY_MAP) as *mut EfiMemoryDescriptor;
+    let status = unsafe {
+        ((*bs).get_memory_map)(
+            &mut map_size,
+            memory_map,
+            &mut map_key,
+            &mut descriptor_size,
+            &mut descriptor_version,
+        )
+    };
+    if status.is_error() || descriptor_size == 0 {
+        return false;
+    }
+
+    let count = map_size / descriptor_size;
+    let mut i = 0usize;
+    while i < count {
+        let desc_ptr = unsafe { (memory_map as *const u8).add(i * descriptor_size) }
+            as *const EfiMemoryDescriptor;
+        let desc = unsafe { &*desc_ptr };
+        if desc.memory_type == memory_type && memory_descriptor_contains_range(desc, target, size)
+        {
+            return true;
+        }
+        i += 1;
+    }
+    false
+}
+
+fn print_target_memory_map_probe(
+    bs: *mut EfiBootServices,
+    target: u64,
+    size: u64,
+) -> EfiStatus {
+    let mut map_size = MEMORY_MAP_MAX;
+    let mut map_key = 0usize;
+    let mut descriptor_size = 0usize;
+    let mut descriptor_version = 0u32;
+    let memory_map = core::ptr::addr_of_mut!(MEMORY_MAP) as *mut EfiMemoryDescriptor;
+    let status = unsafe {
+        ((*bs).get_memory_map)(
+            &mut map_size,
+            memory_map,
+            &mut map_key,
+            &mut descriptor_size,
+            &mut descriptor_version,
+        )
+    };
+    write_status("target_memory_map_status: ", status);
+    if status.is_error() || descriptor_size == 0 || size == 0 {
+        return status;
+    }
+
+    let target_end = target + size;
+    let target_last = target_end - 1;
+    write_ascii("target_memory_range_start: 0x");
+    write_hex64(target);
+    write_ascii("\r\n");
+    write_ascii("target_memory_range_end: 0x");
+    write_hex64(target_end);
+    write_ascii("\r\n");
+
+    let mut start_desc: *const EfiMemoryDescriptor = null_mut();
+    let mut last_desc: *const EfiMemoryDescriptor = null_mut();
+    let mut best_start = 0u64;
+    let mut best_pages = 0u64;
+    let count = map_size / descriptor_size;
+    let mut i = 0usize;
+    while i < count {
+        let desc_ptr = unsafe { (memory_map as *const u8).add(i * descriptor_size) }
+            as *const EfiMemoryDescriptor;
+        let desc = unsafe { &*desc_ptr };
+        if start_desc.is_null() && memory_descriptor_contains(desc, target) {
+            start_desc = desc_ptr;
+        }
+        if last_desc.is_null() && memory_descriptor_contains(desc, target_last) {
+            last_desc = desc_ptr;
+        }
+        if desc.memory_type == EFI_CONVENTIONAL_MEMORY && desc.number_of_pages > best_pages {
+            best_start = desc.physical_start;
+            best_pages = desc.number_of_pages;
+        }
+        i += 1;
+    }
+
+    print_memory_descriptor("target_start_desc", start_desc);
+    print_memory_descriptor("target_last_desc", last_desc);
+    write_ascii("memory_map_best_conventional_start: 0x");
+    write_hex64(best_start);
+    write_ascii("\r\n");
+    write_ascii("memory_map_best_conventional_pages: ");
+    write_dec(best_pages);
+    write_ascii("\r\n");
+    write_ascii("memory_map_best_conventional_end: 0x");
+    write_hex64(best_start + best_pages * EFI_PAGE_SIZE as u64);
+    write_ascii("\r\n");
+    status
+}
+
 fn call_kernel(entry_point: u64) -> ! {
     let entry: extern "C" fn() = unsafe { core::mem::transmute(entry_point as usize) };
     entry();

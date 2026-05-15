@@ -22,6 +22,7 @@ const EFI_NOT_FOUND: EfiStatus = EfiStatus(EFI_ERROR_BIT | 14);
 const EFI_ALLOCATE_ANY_PAGES: EfiAllocateType = 0;
 const EFI_ALLOCATE_ADDRESS: EfiAllocateType = 2;
 const EFI_LOADER_DATA: EfiMemoryType = 2;
+const EFI_CONVENTIONAL_MEMORY: EfiMemoryType = 7;
 const EFI_LOCATE_BY_PROTOCOL: EfiLocateSearchType = 2;
 const EVT_NOTIFY_SIGNAL: u32 = 0x0000_0200;
 const TPL_CALLBACK: EfiTpl = 8;
