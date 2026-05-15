@@ -19,7 +19,8 @@ const EFI_NOT_READY: EfiStatus = EfiStatus(EFI_ERROR_BIT | 6);
 const EFI_DEVICE_ERROR: EfiStatus = EfiStatus(EFI_ERROR_BIT | 7);
 const EFI_NOT_FOUND: EfiStatus = EfiStatus(EFI_ERROR_BIT | 14);
 
-const EFI_ALLOCATE_ADDRESS: EfiAllocateType = 0;
+const EFI_ALLOCATE_ANY_PAGES: EfiAllocateType = 0;
+const EFI_ALLOCATE_ADDRESS: EfiAllocateType = 2;
 const EFI_LOADER_DATA: EfiMemoryType = 2;
 const EFI_LOCATE_BY_PROTOCOL: EfiLocateSearchType = 2;
 const EVT_NOTIFY_SIGNAL: u32 = 0x0000_0200;
@@ -33,10 +34,13 @@ const HTTP_STATUS_200_OK: u32 = 3;
 const MANIFEST_MAX: usize = 4096;
 const URL16_MAX: usize = 1024;
 const KERNEL_CHUNK: usize = 16 * 1024;
+const TLS_RX_MAX: usize = 64 * 1024;
 const MAX_KERNEL_SIZE: u64 = 256 * 1024 * 1024;
 const MEMORY_MAP_MAX: usize = 64 * 1024;
 const HTTP_POLL_LIMIT: usize = 1_000_000;
 const TCP4_POLL_LIMIT: usize = 5_000_000;
+const KERNEL_TCP4_POLL_LIMIT: usize = 50_000_000;
+const KERNEL_TCP4_RX_RETRIES: usize = 4;
 
 const EFI_TLS_CONFIG_DATA_TYPE_CA_CERTIFICATE: u32 = 2;
 const EFI_TLS_SESSION_DATA_TYPE_VERSION: u32 = 0;
