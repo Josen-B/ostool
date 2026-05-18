@@ -43,6 +43,7 @@ serialport = "4.6"
 tftpd = "0.5"
 thiserror = {workspace = true}
 tokio = {workspace = true, features = ["full"]}
+tokio-rustls = "0.26"
 tokio-modbus = {version = "0.17.0", default-features = false, features = ["rtu"]}
 tokio-serial = "5.4"
 toml = {workspace = true}

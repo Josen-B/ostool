@@ -5,6 +5,10 @@ import ssl
 from functools import partial
 
 
+class Http11SimpleHTTPRequestHandler(http.server.SimpleHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--bind", default="0.0.0.0")
@@ -14,7 +18,7 @@ def main() -> None:
     parser.add_argument("--key", required=True)
     args = parser.parse_args()
 
-    handler = partial(http.server.SimpleHTTPRequestHandler, directory=args.root)
+    handler = partial(Http11SimpleHTTPRequestHandler, directory=args.root)
     httpd = http.server.ThreadingHTTPServer((args.bind, args.port), handler)
     context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
     context.load_cert_chain(certfile=args.cert, keyfile=args.key)

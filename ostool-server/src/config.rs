@@ -156,6 +156,10 @@ impl ServerConfig {
         self.board_dir = absolutize_path(&config_dir, &self.board_dir);
         self.dtb_dir = absolutize_path(&config_dir, &self.dtb_dir);
         self.http_boot.root_dir = absolutize_path(&config_dir, &self.http_boot.root_dir);
+        self.http_boot.https.cert_path =
+            absolutize_path(&config_dir, &self.http_boot.https.cert_path);
+        self.http_boot.https.key_path =
+            absolutize_path(&config_dir, &self.http_boot.https.key_path);
 
         match &mut self.tftp {
             TftpConfig::Builtin(cfg) => {
@@ -188,12 +192,15 @@ pub struct HttpBootConfig {
     pub enabled: bool,
     pub root_dir: PathBuf,
     pub public_base_url: Option<String>,
+    #[serde(default)]
+    pub https: HttpBootHttpsConfig,
 }
 
 impl HttpBootConfig {
     pub fn default_with_root(root_dir: PathBuf) -> Self {
         Self {
             enabled: true,
+            https: HttpBootHttpsConfig::default_with_root(&root_dir),
             root_dir,
             public_base_url: None,
         }
@@ -203,6 +210,31 @@ impl HttpBootConfig {
 impl Default for HttpBootConfig {
     fn default() -> Self {
         Self::default_with_root(PathBuf::from(".ostool-server/http-boot"))
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct HttpBootHttpsConfig {
+    pub enabled: bool,
+    pub listen_addr: SocketAddr,
+    pub cert_path: PathBuf,
+    pub key_path: PathBuf,
+}
+
+impl HttpBootHttpsConfig {
+    pub fn default_with_root(root_dir: &Path) -> Self {
+        Self {
+            enabled: false,
+            listen_addr: SocketAddr::from(([0, 0, 0, 0], 3443)),
+            cert_path: root_dir.join("certs/httpboot.crt"),
+            key_path: root_dir.join("certs/httpboot.key"),
+        }
+    }
+}
+
+impl Default for HttpBootHttpsConfig {
+    fn default() -> Self {
+        Self::default_with_root(Path::new(".ostool-server/http-boot"))
     }
 }
 

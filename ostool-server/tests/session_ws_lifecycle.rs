@@ -115,6 +115,7 @@ fn spawn_test_server(root: &Path, serial_port: String) -> Result<TestServerHandl
         dtb_dir,
         tftp: TftpConfig::Builtin(BuiltinTftpConfig::default_with_root(tftp_root)),
         http_boot: ostool_server::config::HttpBootConfig::default_with_root(http_boot_root),
+        proxy_dhcp: ostool_server::config::ProxyDhcpConfig::default(),
         network: ostool_server::TftpNetworkConfig {
             interface: "lo".into(),
         },

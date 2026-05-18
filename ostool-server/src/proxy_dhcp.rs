@@ -211,7 +211,9 @@ fn select_board<'a>(
 
 fn proxy_server_ip(config: &ServerConfig) -> anyhow::Result<Ipv4Addr> {
     if let Some(base) = config.http_boot.public_base_url.as_deref()
-        && let Some(rest) = base.strip_prefix("http://")
+        && let Some(rest) = base
+            .strip_prefix("http://")
+            .or_else(|| base.strip_prefix("https://"))
     {
         let host = rest.split([':', '/']).next().unwrap_or_default();
         if let Ok(ip) = host.parse() {

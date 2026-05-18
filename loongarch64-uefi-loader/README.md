@@ -33,7 +33,7 @@ Override the manifest URL:
 
 ```bash
 make -C loongarch64-uefi-loader \
-  MANIFEST_URL=http://10.3.10.229:2999/boot/boards/loongchip-httpboot-smoke/current/manifest.json
+  MANIFEST_URL=https://10.3.10.229:3443/boot/boards/loongchip-httpboot-smoke/current/manifest.json
 ```
 
 Enable the final jump only after download and memory-map observations are stable:

@@ -11,7 +11,7 @@ OUT_DIR ?= ../target/loongarch64-uefi-loader
 TARGET := $(OUT_DIR)/BOOTLOONGARCH64.EFI
 ELF := $(OUT_DIR)/ostool-loongarch64-loader.elf
 
-MANIFEST_URL ?= http://10.3.10.229:2999/boot/boards/loongchip-httpboot-smoke/current/manifest.json
+MANIFEST_URL ?= https://10.3.10.229:3443/boot/boards/loongchip-httpboot-smoke/current/manifest.json
 ENABLE_BOOT_JUMP ?= 0
 
 LDFLAGS := -nostdlib -znocombreloc -T loader.lds

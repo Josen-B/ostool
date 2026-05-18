@@ -17,11 +17,11 @@ pub mod web;
 
 pub use api::router::build_router;
 pub use config::{
-    BoardConfig, BootConfig, BuiltinTftpConfig, CustomPowerManagement, PowerManagementConfig,
-    ProxyDhcpConfig, PxeProfile, SerialConfig, SerialPortKey, SerialPortKeyKind, ServerConfig,
-    SystemTftpdHpaConfig, TftpConfig, TftpNetworkConfig, UbootProfile, UefiBootArch,
-    UefiHttpProfile, UefiHttpStrategy, UploadLimitsConfig, VirtualPowerManagement,
-    ZhongshengRelayPowerManagement,
+    BoardConfig, BootConfig, BuiltinTftpConfig, CustomPowerManagement, HttpBootHttpsConfig,
+    PowerManagementConfig, ProxyDhcpConfig, PxeProfile, SerialConfig, SerialPortKey,
+    SerialPortKeyKind, ServerConfig, SystemTftpdHpaConfig, TftpConfig, TftpNetworkConfig,
+    UbootProfile, UefiBootArch, UefiHttpProfile, UefiHttpStrategy, UploadLimitsConfig,
+    VirtualPowerManagement, ZhongshengRelayPowerManagement,
 };
 pub use dtb_store::{DtbFile, DtbStore};
 pub use state::{AppState, BoardLeaseState, build_app_state};

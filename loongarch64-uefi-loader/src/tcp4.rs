@@ -742,12 +742,15 @@ fn https_get_manifest_probe(
         return None;
     }
 
+    let manifest_path = match https_path_from_url(OSTOOL_MANIFEST_URL.as_bytes()) {
+        Ok(path) => path,
+        Err(status) => {
+            *rx_status = status;
+            return None;
+        }
+    };
     let mut http_get = [0u8; 512];
-    let http_get_len = match build_http_get_request(
-        b"/boot/boards/loongchip-httpboot-smoke/current/manifest.json",
-        b"keep-alive",
-        &mut http_get,
-    ) {
+    let http_get_len = match build_http_get_request(manifest_path, b"keep-alive", &mut http_get) {
         Ok(len) => len,
         Err(status) => {
             *rx_status = status;
@@ -1205,6 +1208,344 @@ fn https_download_kernel_probe(
     }
 
     EFI_SUCCESS
+}
+
+fn close_tcp4_child(
+    bs: *mut EfiBootServices,
+    tcp4: *mut EfiTcp4Protocol,
+    label: &str,
+) {
+    let mut close_event = null_mut();
+    let close_event_status = unsafe {
+        ((*bs).create_event)(
+            EVT_NOTIFY_SIGNAL,
+            TPL_CALLBACK,
+            Some(noop_event),
+            null_mut(),
+            &mut close_event,
+        )
+    };
+    write_prefixed_status(label, "_close_event_status", close_event_status);
+    if !close_event_status.is_error() {
+        let mut close_token = EfiTcp4CloseToken {
+            completion_token: EfiTcp4CompletionToken {
+                event: close_event,
+                status: EFI_NOT_READY,
+            },
+            abort_on_close: 1,
+        };
+        let close_submit_status = unsafe { ((*tcp4).close)(tcp4, &mut close_token) };
+        write_prefixed_status(label, "_close_submit_status", close_submit_status);
+        if !close_submit_status.is_error() {
+            let close_completion = poll_tcp4(tcp4, &close_token.completion_token);
+            write_prefixed_status(label, "_close_completion", close_completion);
+        }
+        unsafe {
+            ((*bs).close_event)(close_event);
+        }
+    }
+}
+
+fn connect_tcp4_child(
+    bs: *mut EfiBootServices,
+    tcp_binding: *mut EfiServiceBindingProtocol,
+    out_child: &mut EfiHandle,
+    label: &str,
+) -> Result<*mut EfiTcp4Protocol, EfiStatus> {
+    *out_child = null_mut();
+    let status = unsafe { ((*tcp_binding).create_child)(tcp_binding, out_child) };
+    write_prefixed_status(label, "_tcp_create_child_status", status);
+    if status.is_error() || (*out_child).is_null() {
+        return Err(if status.is_error() {
+            status
+        } else {
+            EFI_UNSUPPORTED
+        });
+    }
+
+    let tcp4 = match open_protocol::<EfiTcp4Protocol>(bs, *out_child, &EFI_TCP4_PROTOCOL_GUID) {
+        Ok(tcp4) => {
+            write_prefixed_status(label, "_tcp_protocol_status", EFI_SUCCESS);
+            tcp4
+        }
+        Err(status) => {
+            write_prefixed_status(label, "_tcp_protocol_status", status);
+            unsafe {
+                ((*tcp_binding).destroy_child)(tcp_binding, *out_child);
+            }
+            *out_child = null_mut();
+            return Err(status);
+        }
+    };
+
+    let mut config = EfiTcp4ConfigData {
+        type_of_service: 0,
+        time_to_live: 64,
+        access_point: EfiTcp4AccessPoint {
+            use_default_address: 1,
+            station_address: [0; 4],
+            subnet_mask: [0; 4],
+            station_port: 0,
+            remote_address: [10, 3, 10, 229],
+            remote_port: 3443,
+            active_flag: 1,
+        },
+        control_option: EfiTcp4Option {
+            receive_buffer_size: 0,
+            send_buffer_size: 0,
+            max_syn_back_log: 0,
+            connection_timeout: 0,
+            data_retries: 0,
+            fin_timeout: 0,
+            time_wait_timeout: 0,
+            keep_alive_probes: 0,
+            keep_alive_time: 0,
+            keep_alive_interval: 0,
+            enable_nagle: 0,
+            enable_time_stamp: 0,
+            enable_window_scaling: 0,
+            enable_selective_ack: 0,
+            enable_path_mtu_discovery: 0,
+        },
+    };
+    let status = unsafe { ((*tcp4).configure)(tcp4, &mut config) };
+    write_prefixed_status(label, "_tcp_configure_status", status);
+    if status.is_error() {
+        unsafe {
+            ((*tcp_binding).destroy_child)(tcp_binding, *out_child);
+        }
+        *out_child = null_mut();
+        return Err(status);
+    }
+
+    let mut connect_event = null_mut();
+    let status = unsafe {
+        ((*bs).create_event)(
+            EVT_NOTIFY_SIGNAL,
+            TPL_CALLBACK,
+            Some(noop_event),
+            null_mut(),
+            &mut connect_event,
+        )
+    };
+    write_prefixed_status(label, "_connect_event_status", status);
+    if status.is_error() {
+        unsafe {
+            ((*tcp4).configure)(tcp4, null_mut());
+            ((*tcp_binding).destroy_child)(tcp_binding, *out_child);
+        }
+        *out_child = null_mut();
+        return Err(status);
+    }
+
+    let mut connect_token = EfiTcp4ConnectionToken {
+        completion_token: EfiTcp4CompletionToken {
+            event: connect_event,
+            status: EFI_NOT_READY,
+        },
+    };
+    let submit_status = unsafe { ((*tcp4).connect)(tcp4, &mut connect_token) };
+    write_prefixed_status(label, "_connect_submit_status", submit_status);
+    let connect_status = if submit_status.is_error() {
+        submit_status
+    } else {
+        poll_tcp4(tcp4, &connect_token.completion_token)
+    };
+    write_prefixed_status(label, "_connect_completion", connect_status);
+    unsafe {
+        ((*bs).close_event)(connect_event);
+    }
+    if connect_status.is_error() {
+        unsafe {
+            ((*tcp4).configure)(tcp4, null_mut());
+            ((*tcp_binding).destroy_child)(tcp_binding, *out_child);
+        }
+        *out_child = null_mut();
+        return Err(connect_status);
+    }
+
+    Ok(tcp4)
+}
+
+fn complete_tls_handshake_on_fresh_connection(
+    bs: *mut EfiBootServices,
+    tcp4: *mut EfiTcp4Protocol,
+    tls: *mut EfiTlsProtocol,
+    clienthello: &mut [u8],
+    clienthello_len: usize,
+) -> EfiStatus {
+    tls_session_state(tls, "tcp4_tls_kernel_fresh_initial");
+
+    let mut rx = [0u8; 8192];
+    let mut rx_len = 0usize;
+    let mut rx_status = tcp4_transmit_with_pre_receive(
+        bs,
+        tcp4,
+        &mut clienthello[..clienthello_len],
+        &mut rx,
+        &mut rx_len,
+        "tcp4_tls_kernel_fresh",
+    );
+
+    let mut tls_out = [0u8; 8192];
+    let mut round = 0usize;
+    while !rx_status.is_error() && round < 4 {
+        let label = match round {
+            0 => "tcp4_tls_kernel_fresh_hs0",
+            1 => "tcp4_tls_kernel_fresh_hs1",
+            2 => "tcp4_tls_kernel_fresh_hs2",
+            _ => "tcp4_tls_kernel_fresh_hs3",
+        };
+
+        tls_session_state(tls, label);
+        let mut tls_out_len = tls_out.len();
+        let build_status = unsafe {
+            ((*tls).build_response_packet)(
+                tls,
+                rx.as_mut_ptr(),
+                rx_len,
+                tls_out.as_mut_ptr(),
+                &mut tls_out_len,
+            )
+        };
+        write_prefixed_status(label, "_build_response_status", build_status);
+        write_ascii(label);
+        write_ascii("_build_response_len: ");
+        write_dec(tls_out_len as u64);
+        write_ascii("\r\n");
+        print_tcp4_first5(label, "_build_response_first5: ", &tls_out, tls_out_len);
+        let state = tls_session_state(tls, label);
+        if build_status.is_error() {
+            return build_status;
+        }
+        if state == EFI_TLS_SESSION_DATA_TRANSFERRING {
+            return EFI_SUCCESS;
+        }
+        if tls_out_len == 0 || tls_out_len > tls_out.len() {
+            return EFI_NOT_READY;
+        }
+        rx_status = tcp4_transmit_with_pre_receive(
+            bs,
+            tcp4,
+            &mut tls_out[..tls_out_len],
+            &mut rx,
+            &mut rx_len,
+            label,
+        );
+        round += 1;
+    }
+
+    if rx_status.is_error() {
+        rx_status
+    } else {
+        EFI_NOT_READY
+    }
+}
+
+fn https_download_kernel_fresh_probe(
+    bs: *mut EfiBootServices,
+    tcp_binding: *mut EfiServiceBindingProtocol,
+    tls_binding: *mut EfiServiceBindingProtocol,
+    manifest: &Manifest,
+    loaded_at_manifest_addr: &mut bool,
+) -> EfiStatus {
+    write_ascii("tcp4_tls_probe_kernel_fresh_start\r\n");
+
+    let mut tls_child = null_mut();
+    let status = unsafe { ((*tls_binding).create_child)(tls_binding, &mut tls_child) };
+    write_status("tcp4_tls_probe_kernel_fresh_tls_create_child_status: ", status);
+    if status.is_error() || tls_child.is_null() {
+        return if status.is_error() {
+            status
+        } else {
+            EFI_UNSUPPORTED
+        };
+    }
+
+    let mut clienthello = [0u8; 2048];
+    let mut clienthello_len = 0usize;
+    let mut status = build_tls_clienthello_on_child(
+        bs,
+        tls_child,
+        &mut clienthello,
+        &mut clienthello_len,
+        "tcp4_tls_probe_kernel_fresh_tls_config",
+    );
+    write_status(
+        "tcp4_tls_probe_kernel_fresh_build_clienthello_status: ",
+        status,
+    );
+    write_ascii("tcp4_tls_probe_kernel_fresh_clienthello_len: ");
+    write_dec(clienthello_len as u64);
+    write_ascii("\r\n");
+    if status.is_error() || clienthello_len == 0 || clienthello_len > clienthello.len() {
+        unsafe {
+            ((*tls_binding).destroy_child)(tls_binding, tls_child);
+        }
+        return status;
+    }
+
+    let mut tcp_child = null_mut();
+    let tcp4 = match connect_tcp4_child(
+        bs,
+        tcp_binding,
+        &mut tcp_child,
+        "tcp4_tls_probe_kernel_fresh",
+    ) {
+        Ok(tcp4) => tcp4,
+        Err(status) => {
+            unsafe {
+                ((*tls_binding).destroy_child)(tls_binding, tls_child);
+            }
+            return status;
+        }
+    };
+
+    let tls = match open_protocol::<EfiTlsProtocol>(bs, tls_child, &EFI_TLS_PROTOCOL_GUID) {
+        Ok(tls) => {
+            write_status(
+                "tcp4_tls_probe_kernel_fresh_tls_protocol_reopen_status: ",
+                EFI_SUCCESS,
+            );
+            tls
+        }
+        Err(status) => {
+            write_status(
+                "tcp4_tls_probe_kernel_fresh_tls_protocol_reopen_status: ",
+                status,
+            );
+            close_tcp4_child(bs, tcp4, "tcp4_tls_probe_kernel_fresh");
+            unsafe {
+                ((*tcp4).configure)(tcp4, null_mut());
+                ((*tcp_binding).destroy_child)(tcp_binding, tcp_child);
+                ((*tls_binding).destroy_child)(tls_binding, tls_child);
+            }
+            return status;
+        }
+    };
+
+    status = complete_tls_handshake_on_fresh_connection(
+        bs,
+        tcp4,
+        tls,
+        &mut clienthello,
+        clienthello_len,
+    );
+    write_status(
+        "tcp4_tls_probe_kernel_fresh_handshake_status: ",
+        status,
+    );
+    if !status.is_error() {
+        status = https_download_kernel_probe(bs, tcp4, tls, manifest, loaded_at_manifest_addr);
+    }
+
+    close_tcp4_child(bs, tcp4, "tcp4_tls_probe_kernel_fresh");
+    unsafe {
+        ((*tcp4).configure)(tcp4, null_mut());
+        ((*tcp_binding).destroy_child)(tcp_binding, tcp_child);
+        ((*tls_binding).destroy_child)(tls_binding, tls_child);
+    }
+    status
 }
 
 fn tls_process_single_fragment(
@@ -1705,8 +2046,13 @@ fn tcp4_tls_clienthello_probe(image: EfiHandle, bs: *mut EfiBootServices) -> Efi
         write_dec(manifest.kernel_size);
         write_ascii("\r\n");
         let mut loaded_at_manifest_addr = false;
-        rx_status =
-            https_download_kernel_probe(bs, tcp4, tls, &manifest, &mut loaded_at_manifest_addr);
+        rx_status = https_download_kernel_fresh_probe(
+            bs,
+            tcp_binding,
+            tls_binding,
+            &manifest,
+            &mut loaded_at_manifest_addr,
+        );
         write_status("tcp4_tls_probe_kernel_download_status: ", rx_status);
         if !rx_status.is_error() {
             let mut map_key = 0usize;

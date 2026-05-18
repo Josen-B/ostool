@@ -1485,11 +1485,13 @@ fn http_boot_url(
 ) -> Result<String, ApiError> {
     let relative_path = normalize_relative_path(relative_path)
         .map_err(|err| ApiError::bad_request(err.to_string()))?;
-    let base_url = config
-        .http_boot
-        .public_base_url
-        .clone()
-        .unwrap_or_else(|| format!("http://{}", config.listen_addr));
+    let base_url = config.http_boot.public_base_url.clone().unwrap_or_else(|| {
+        if config.http_boot.https.enabled {
+            format!("https://{}", config.http_boot.https.listen_addr)
+        } else {
+            format!("http://{}", config.listen_addr)
+        }
+    });
     let base_url = base_url.trim_end_matches('/');
     Ok(format!(
         "{base_url}/boot/boards/{board_id}/current/{relative_path}"
@@ -1813,6 +1815,7 @@ mod tests {
             dtb_dir: root.join("dtbs"),
             tftp: TftpConfig::Builtin(BuiltinTftpConfig::default_with_root(root.join("tftp"))),
             http_boot: crate::config::HttpBootConfig::default_with_root(root.join("http-boot")),
+            proxy_dhcp: crate::config::ProxyDhcpConfig::default(),
             network: crate::TftpNetworkConfig {
                 interface: "lo".into(),
             },
