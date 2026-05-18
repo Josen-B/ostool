@@ -1,4 +1,14 @@
 static mut MEMORY_MAP: [u8; MEMORY_MAP_MAX] = [0; MEMORY_MAP_MAX];
+static mut KERNEL_BOOT_INFO: OstoolKernelBootInfo = OstoolKernelBootInfo {
+    magic: OSTOOL_KERNEL_BOOT_INFO_MAGIC,
+    version: 1,
+    framebuffer_base: 0,
+    framebuffer_size: 0,
+    horizontal_resolution: 0,
+    vertical_resolution: 0,
+    pixels_per_scan_line: 0,
+    pixel_format: 0xffff_ffff,
+};
 
 fn page_count(size: u64) -> usize {
     ((size as usize) + EFI_PAGE_SIZE - 1) / EFI_PAGE_SIZE
@@ -117,6 +127,39 @@ fn print_memory_map(bs: *mut EfiBootServices, map_key_out: &mut usize) -> EfiSta
     status
 }
 
+fn get_memory_map_key(bs: *mut EfiBootServices, map_key_out: &mut usize) -> EfiStatus {
+    let mut map_size = MEMORY_MAP_MAX;
+    let mut descriptor_size = 0usize;
+    let mut descriptor_version = 0u32;
+    let memory_map = core::ptr::addr_of_mut!(MEMORY_MAP) as *mut EfiMemoryDescriptor;
+    unsafe {
+        ((*bs).get_memory_map)(
+            &mut map_size,
+            memory_map,
+            map_key_out,
+            &mut descriptor_size,
+            &mut descriptor_version,
+        )
+    }
+}
+
+fn exit_boot_services_with_fresh_map(image: EfiHandle, bs: *mut EfiBootServices) -> EfiStatus {
+    let mut map_key = 0usize;
+    let mut status = get_memory_map_key(bs, &mut map_key);
+    if status.is_error() {
+        return status;
+    }
+    status = unsafe { ((*bs).exit_boot_services)(image, map_key) };
+    if status == EFI_INVALID_PARAMETER {
+        status = get_memory_map_key(bs, &mut map_key);
+        if status.is_error() {
+            return status;
+        }
+        status = unsafe { ((*bs).exit_boot_services)(image, map_key) };
+    }
+    status
+}
+
 fn print_memory_descriptor(label: &str, descriptor: *const EfiMemoryDescriptor) {
     if descriptor.is_null() {
         write_ascii(label);
@@ -151,60 +194,7 @@ fn memory_descriptor_contains(desc: &EfiMemoryDescriptor, address: u64) -> bool 
     start <= address && address < end
 }
 
-fn memory_descriptor_contains_range(desc: &EfiMemoryDescriptor, target: u64, size: u64) -> bool {
-    if size == 0 {
-        return false;
-    }
-    let start = desc.physical_start;
-    let end = start + desc.number_of_pages * EFI_PAGE_SIZE as u64;
-    let target_end = target + size;
-    start <= target && target_end <= end
-}
-
-fn target_range_has_memory_type(
-    bs: *mut EfiBootServices,
-    target: u64,
-    size: u64,
-    memory_type: EfiMemoryType,
-) -> bool {
-    let mut map_size = MEMORY_MAP_MAX;
-    let mut map_key = 0usize;
-    let mut descriptor_size = 0usize;
-    let mut descriptor_version = 0u32;
-    let memory_map = core::ptr::addr_of_mut!(MEMORY_MAP) as *mut EfiMemoryDescriptor;
-    let status = unsafe {
-        ((*bs).get_memory_map)(
-            &mut map_size,
-            memory_map,
-            &mut map_key,
-            &mut descriptor_size,
-            &mut descriptor_version,
-        )
-    };
-    if status.is_error() || descriptor_size == 0 {
-        return false;
-    }
-
-    let count = map_size / descriptor_size;
-    let mut i = 0usize;
-    while i < count {
-        let desc_ptr = unsafe { (memory_map as *const u8).add(i * descriptor_size) }
-            as *const EfiMemoryDescriptor;
-        let desc = unsafe { &*desc_ptr };
-        if desc.memory_type == memory_type && memory_descriptor_contains_range(desc, target, size)
-        {
-            return true;
-        }
-        i += 1;
-    }
-    false
-}
-
-fn print_target_memory_map_probe(
-    bs: *mut EfiBootServices,
-    target: u64,
-    size: u64,
-) -> EfiStatus {
+fn print_target_memory_map_probe(bs: *mut EfiBootServices, target: u64, size: u64) -> EfiStatus {
     let mut map_size = MEMORY_MAP_MAX;
     let mut map_key = 0usize;
     let mut descriptor_size = 0usize;
@@ -270,9 +260,65 @@ fn print_target_memory_map_probe(
     status
 }
 
-fn call_kernel(entry_point: u64) -> ! {
-    let entry: extern "C" fn() = unsafe { core::mem::transmute(entry_point as usize) };
-    entry();
+fn prepare_kernel_boot_info(bs: *mut EfiBootServices) -> *const OstoolKernelBootInfo {
+    unsafe {
+        KERNEL_BOOT_INFO = OstoolKernelBootInfo {
+            magic: OSTOOL_KERNEL_BOOT_INFO_MAGIC,
+            version: 1,
+            framebuffer_base: 0,
+            framebuffer_size: 0,
+            horizontal_resolution: 0,
+            vertical_resolution: 0,
+            pixels_per_scan_line: 0,
+            pixel_format: 0xffff_ffff,
+        };
+    }
+
+    let mut gop_ptr: *mut c_void = null_mut();
+    let status = unsafe {
+        ((*bs).locate_protocol)(&EFI_GRAPHICS_OUTPUT_PROTOCOL_GUID, null_mut(), &mut gop_ptr)
+    };
+    write_status("kernel_boot_info_gop_status: ", status);
+    if !status.is_error() && !gop_ptr.is_null() {
+        let gop = gop_ptr as *mut EfiGraphicsOutputProtocol;
+        let mode = unsafe { (*gop).mode };
+        if !mode.is_null() {
+            let info = unsafe { (*mode).info };
+            unsafe {
+                KERNEL_BOOT_INFO.framebuffer_base = (*mode).frame_buffer_base;
+                KERNEL_BOOT_INFO.framebuffer_size = (*mode).frame_buffer_size as u64;
+                if !info.is_null() {
+                    KERNEL_BOOT_INFO.horizontal_resolution = (*info).horizontal_resolution;
+                    KERNEL_BOOT_INFO.vertical_resolution = (*info).vertical_resolution;
+                    KERNEL_BOOT_INFO.pixels_per_scan_line = (*info).pixels_per_scan_line;
+                    KERNEL_BOOT_INFO.pixel_format = (*info).pixel_format;
+                }
+            }
+        }
+    }
+    unsafe {
+        write_ascii("kernel_boot_info_ptr: 0x");
+        write_hex64(core::ptr::addr_of!(KERNEL_BOOT_INFO) as u64);
+        write_ascii("\r\n");
+        write_ascii("kernel_boot_info_fb_base: 0x");
+        write_hex64(KERNEL_BOOT_INFO.framebuffer_base);
+        write_ascii("\r\n");
+        write_ascii("kernel_boot_info_fb_size: ");
+        write_dec(KERNEL_BOOT_INFO.framebuffer_size);
+        write_ascii("\r\n");
+        write_ascii("kernel_boot_info_resolution: ");
+        write_dec(KERNEL_BOOT_INFO.horizontal_resolution as u64);
+        write_ascii("x");
+        write_dec(KERNEL_BOOT_INFO.vertical_resolution as u64);
+        write_ascii("\r\n");
+        core::ptr::addr_of!(KERNEL_BOOT_INFO)
+    }
+}
+
+fn call_kernel(entry_point: u64, boot_info: *const OstoolKernelBootInfo) -> ! {
+    let entry: extern "C" fn(*const OstoolKernelBootInfo) =
+        unsafe { core::mem::transmute(entry_point as usize) };
+    entry(boot_info);
     loop {
         core::hint::spin_loop();
     }
@@ -440,9 +486,10 @@ fn try_manifest_with_fresh_http_child(
         return EFI_SUCCESS;
     }
 
-    let status = unsafe { ((*bs).exit_boot_services)(image, map_key) };
+    let boot_info = prepare_kernel_boot_info(bs);
+    let status = exit_boot_services_with_fresh_map(image, bs);
     if !status.is_error() {
-        call_kernel(manifest.entry_point);
+        call_kernel(manifest.entry_point, boot_info);
     }
     write_status("exit_boot_services_status: ", status);
     write_ascii("jump_failed\r\n");

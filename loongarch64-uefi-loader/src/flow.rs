@@ -102,6 +102,7 @@ extern "C" fn efi_main(image: EfiHandle, system_table: *mut EfiSystemTable) -> E
     if bs.is_null() {
         return EFI_SUCCESS;
     }
+    configure_serial_output(bs);
 
     print_protocol_handle_count(
         bs,

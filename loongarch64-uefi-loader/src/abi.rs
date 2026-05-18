@@ -13,17 +13,29 @@ struct EfiStatus(u64);
 
 const EFI_SUCCESS: EfiStatus = EfiStatus(0);
 const EFI_ERROR_BIT: u64 = 1 << 63;
+const EFI_INVALID_PARAMETER: EfiStatus = EfiStatus(EFI_ERROR_BIT | 2);
 const EFI_UNSUPPORTED: EfiStatus = EfiStatus(EFI_ERROR_BIT | 3);
 const EFI_BUFFER_TOO_SMALL: EfiStatus = EfiStatus(EFI_ERROR_BIT | 5);
 const EFI_NOT_READY: EfiStatus = EfiStatus(EFI_ERROR_BIT | 6);
 const EFI_DEVICE_ERROR: EfiStatus = EfiStatus(EFI_ERROR_BIT | 7);
 const EFI_NOT_FOUND: EfiStatus = EfiStatus(EFI_ERROR_BIT | 14);
 
-const EFI_ALLOCATE_ANY_PAGES: EfiAllocateType = 0;
 const EFI_ALLOCATE_ADDRESS: EfiAllocateType = 2;
 const EFI_LOADER_DATA: EfiMemoryType = 2;
 const EFI_CONVENTIONAL_MEMORY: EfiMemoryType = 7;
 const EFI_LOCATE_BY_PROTOCOL: EfiLocateSearchType = 2;
+const EFI_SERIAL_IO_PROTOCOL_GUID: EfiGuid = EfiGuid {
+    data1: 0xbb25cf6f,
+    data2: 0xf1d4,
+    data3: 0x11d2,
+    data4: [0x9a, 0x0c, 0x00, 0x90, 0x27, 0x3f, 0xc1, 0xfd],
+};
+const EFI_GRAPHICS_OUTPUT_PROTOCOL_GUID: EfiGuid = EfiGuid {
+    data1: 0x9042a9de,
+    data2: 0x23dc,
+    data3: 0x4a38,
+    data4: [0x96, 0xfb, 0x7a, 0xde, 0xd0, 0x80, 0x51, 0x6a],
+};
 const EVT_NOTIFY_SIGNAL: u32 = 0x0000_0200;
 const TPL_CALLBACK: EfiTpl = 8;
 const EFI_PAGE_SIZE: usize = 4096;
@@ -77,6 +89,18 @@ struct EfiTableHeader {
 struct EfiSimpleTextOutputProtocol {
     reset: usize,
     output_string: extern "C" fn(*mut EfiSimpleTextOutputProtocol, *const u16) -> EfiStatus,
+}
+
+#[repr(C)]
+struct EfiSerialIoProtocol {
+    revision: u32,
+    reset: usize,
+    set_attributes: usize,
+    set_control: usize,
+    get_control: usize,
+    write: extern "C" fn(*mut EfiSerialIoProtocol, *mut usize, *mut c_void) -> EfiStatus,
+    read: usize,
+    mode: *mut c_void,
 }
 
 #[repr(C)]
@@ -147,6 +171,9 @@ struct EfiBootServices {
         *mut usize,
         *mut *mut EfiHandle,
     ) -> EfiStatus,
+    locate_protocol: extern "C" fn(*const EfiGuid, *mut c_void, *mut *mut c_void) -> EfiStatus,
+    install_multiple_protocol_interfaces: usize,
+    uninstall_multiple_protocol_interfaces: usize,
 }
 
 #[repr(C)]
@@ -169,6 +196,48 @@ struct EfiServiceBindingProtocol {
     create_child: extern "C" fn(*mut EfiServiceBindingProtocol, *mut EfiHandle) -> EfiStatus,
     destroy_child: extern "C" fn(*mut EfiServiceBindingProtocol, EfiHandle) -> EfiStatus,
 }
+
+#[repr(C)]
+struct EfiGraphicsOutputProtocol {
+    query_mode: usize,
+    set_mode: usize,
+    blt: usize,
+    mode: *mut EfiGraphicsOutputProtocolMode,
+}
+
+#[repr(C)]
+struct EfiGraphicsOutputProtocolMode {
+    max_mode: u32,
+    mode: u32,
+    info: *mut EfiGraphicsOutputModeInformation,
+    size_of_info: usize,
+    frame_buffer_base: u64,
+    frame_buffer_size: usize,
+}
+
+#[repr(C)]
+struct EfiGraphicsOutputModeInformation {
+    version: u32,
+    horizontal_resolution: u32,
+    vertical_resolution: u32,
+    pixel_format: u32,
+    pixel_information: [u32; 4],
+    pixels_per_scan_line: u32,
+}
+
+#[repr(C)]
+struct OstoolKernelBootInfo {
+    magic: u64,
+    version: u64,
+    framebuffer_base: u64,
+    framebuffer_size: u64,
+    horizontal_resolution: u32,
+    vertical_resolution: u32,
+    pixels_per_scan_line: u32,
+    pixel_format: u32,
+}
+
+const OSTOOL_KERNEL_BOOT_INFO_MAGIC: u64 = 0x4f53_544f_4f4c_4249;
 
 #[repr(C)]
 union EfiHttpConfigAccessPoint {

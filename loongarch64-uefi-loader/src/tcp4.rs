@@ -445,7 +445,11 @@ fn https_path_from_url<'a>(url: &'a [u8]) -> Result<&'a [u8], EfiStatus> {
     Err(EFI_UNSUPPORTED)
 }
 
-fn build_http_get_request(path: &[u8], connection: &[u8], out: &mut [u8]) -> Result<usize, EfiStatus> {
+fn build_http_get_request(
+    path: &[u8],
+    connection: &[u8],
+    out: &mut [u8],
+) -> Result<usize, EfiStatus> {
     const PREFIX: &[u8] = b"GET ";
     const VERSION_HOST: &[u8] = b" HTTP/1.1\r\nHost: 10.3.10.229\r\nConnection: ";
     const SUFFIX: &[u8] = b"\r\n\r\n";
@@ -540,6 +544,36 @@ fn find_tls_app_record_start(bytes: &[u8], len: usize) -> Option<usize> {
     None
 }
 
+fn tls_plaintext_payload_offset(bytes: *const u8, len: usize) -> usize {
+    if len < 5 || bytes.is_null() {
+        return 0;
+    }
+    let content_type = unsafe { read_volatile(bytes) };
+    let version_major = unsafe { read_volatile(bytes.add(1)) };
+    let version_minor = unsafe { read_volatile(bytes.add(2)) };
+    if content_type == 23 && version_major == 3 && version_minor == 3 {
+        5
+    } else {
+        0
+    }
+}
+
+fn print_kernel_entry_first16(entry: u64) {
+    write_ascii("tcp4_tls_probe_kernel_entry_first16: ");
+    let ptr = entry as *const u8;
+    let mut i = 0usize;
+    while i < 16 {
+        if i > 0 {
+            write_ascii(",");
+        }
+        write_ascii("0x");
+        let b = unsafe { read_volatile(ptr.add(i)) };
+        write_hex64(b as u64);
+        i += 1;
+    }
+    write_ascii("\r\n");
+}
+
 fn tcp4_receive_kernel_once(
     bs: *mut EfiBootServices,
     tcp4: *mut EfiTcp4Protocol,
@@ -624,12 +658,7 @@ fn tcp4_receive_kernel_once(
                 write_ascii("tcp4_tls_probe_kernel_rx_len: ");
                 write_dec(*received_len as u64);
                 write_ascii("\r\n");
-                print_tcp4_first5(
-                    "tcp4_tls_probe_kernel_rx",
-                    "_first5: ",
-                    out,
-                    *received_len,
-                );
+                print_tcp4_first5("tcp4_tls_probe_kernel_rx", "_first5: ", out, *received_len);
             }
             unsafe {
                 ((*bs).close_event)(event);
@@ -669,8 +698,13 @@ fn https_send_get_with_pre_receive(
         return EFI_BUFFER_TOO_SMALL;
     }
 
-    let (encrypt_status, encrypted_len, encrypted_ptr) =
-        tls_process_single_fragment(tls, &mut plain_record, plain_record_len, EFI_TLS_ENCRYPT, label);
+    let (encrypt_status, encrypted_len, encrypted_ptr) = tls_process_single_fragment(
+        tls,
+        &mut plain_record,
+        plain_record_len,
+        EFI_TLS_ENCRYPT,
+        label,
+    );
     if encrypt_status.is_error() || encrypted_len == 0 {
         return encrypt_status;
     }
@@ -752,8 +786,13 @@ fn https_get_manifest_probe(
             return None;
         }
         if decrypted_len > 0 {
+            let payload_offset =
+                tls_plaintext_payload_offset(decrypted_ptr as *const u8, decrypted_len);
+            let decrypted_ptr = unsafe { (decrypted_ptr as *mut u8).add(payload_offset) };
+            let decrypted_len = decrypted_len - payload_offset;
             let mut decrypted = [0u8; 1024];
-            let decrypted_len = copy_from_ptr(&mut decrypted, decrypted_ptr, decrypted_len);
+            let decrypted_len =
+                copy_from_ptr(&mut decrypted, decrypted_ptr as *mut c_void, decrypted_len);
             if loop_count == 0 {
                 print_ascii_prefix("tcp4_tls_probe_app_decrypt", &decrypted, decrypted_len);
             }
@@ -848,48 +887,25 @@ fn https_download_kernel_probe(
 
     let pages = page_count(manifest.kernel_size);
     let mut target = manifest.kernel_load_addr;
-    let mut allocate_status = unsafe {
+    let allocate_status = unsafe {
         ((*bs).allocate_pages)(EFI_ALLOCATE_ADDRESS, EFI_LOADER_DATA, pages, &mut target)
     };
-    write_status("tcp4_tls_probe_kernel_allocate_pages_status: ", allocate_status);
+    write_status(
+        "tcp4_tls_probe_kernel_allocate_pages_status: ",
+        allocate_status,
+    );
     write_ascii("tcp4_tls_probe_kernel_target_addr: 0x");
     write_hex64(target);
     write_ascii("\r\n");
     if allocate_status.is_error() || target != manifest.kernel_load_addr {
-        let target_is_loader_data = target_range_has_memory_type(
-            bs,
-            manifest.kernel_load_addr,
-            manifest.kernel_size,
-            EFI_LOADER_DATA,
-        );
-        write_ascii("tcp4_tls_probe_kernel_target_loader_data_after_allocate: ");
-        write_ascii(if target_is_loader_data {
-            "yes\r\n"
+        *loaded_at_manifest_addr = false;
+        write_ascii("tcp4_tls_probe_kernel_fixed_address_required\r\n");
+        print_target_memory_map_probe(bs, manifest.kernel_load_addr, manifest.kernel_size);
+        return if allocate_status.is_error() {
+            allocate_status
         } else {
-            "no\r\n"
-        });
-        if target == manifest.kernel_load_addr && target_is_loader_data {
-            write_ascii("tcp4_tls_probe_kernel_allocate_error_accepted: yes\r\n");
-            *loaded_at_manifest_addr = true;
-        } else {
-            *loaded_at_manifest_addr = false;
-            write_ascii("tcp4_tls_probe_kernel_staging_fallback: yes\r\n");
-            target = 0;
-            allocate_status = unsafe {
-                ((*bs).allocate_pages)(EFI_ALLOCATE_ANY_PAGES, EFI_LOADER_DATA, pages, &mut target)
-            };
-            write_status(
-                "tcp4_tls_probe_kernel_staging_allocate_pages_status: ",
-                allocate_status,
-            );
-            write_ascii("tcp4_tls_probe_kernel_staging_addr: 0x");
-            write_hex64(target);
-            write_ascii("\r\n");
-            if allocate_status.is_error() {
-                return allocate_status;
-            }
-            *loaded_at_manifest_addr = target == manifest.kernel_load_addr;
-        }
+            EFI_DEVICE_ERROR
+        };
     } else {
         *loaded_at_manifest_addr = true;
     }
@@ -1096,6 +1112,10 @@ fn https_download_kernel_probe(
             write_ascii("\r\n");
             break;
         }
+        let payload_offset =
+            tls_plaintext_payload_offset(decrypted_ptr as *const u8, decrypted_len);
+        let decrypted_ptr = unsafe { (decrypted_ptr as *mut u8).add(payload_offset) };
+        let decrypted_len = decrypted_len - payload_offset;
 
         let mut offset = 0usize;
         let mut data_len = decrypted_len;
@@ -1133,7 +1153,11 @@ fn https_download_kernel_probe(
 
         if saw_header && data_len > 0 {
             let remaining = (manifest.kernel_size - downloaded) as usize;
-            let copy_len = if data_len > remaining { remaining } else { data_len };
+            let copy_len = if data_len > remaining {
+                remaining
+            } else {
+                data_len
+            };
             let src = unsafe { (decrypted_ptr as *const u8).add(offset) };
             let dst = (target + downloaded) as *mut u8;
             let mut i = 0usize;
@@ -1334,7 +1358,11 @@ fn tcp4_transmit_with_pre_receive(
     } else if !pre_rx_submit_status.is_error() {
         let completion = poll_tcp4(tcp4, &rx_token.completion_token);
         write_prefixed_status(label, "_pre_rx_completion", completion);
-        write_prefixed_status(label, "_pre_rx_token_status", rx_token.completion_token.status);
+        write_prefixed_status(
+            label,
+            "_pre_rx_token_status",
+            rx_token.completion_token.status,
+        );
         if completion.is_error() {
             *received_len = 0;
         } else {
@@ -1677,7 +1705,8 @@ fn tcp4_tls_clienthello_probe(image: EfiHandle, bs: *mut EfiBootServices) -> Efi
         write_dec(manifest.kernel_size);
         write_ascii("\r\n");
         let mut loaded_at_manifest_addr = false;
-        rx_status = https_download_kernel_probe(bs, tcp4, tls, &manifest, &mut loaded_at_manifest_addr);
+        rx_status =
+            https_download_kernel_probe(bs, tcp4, tls, &manifest, &mut loaded_at_manifest_addr);
         write_status("tcp4_tls_probe_kernel_download_status: ", rx_status);
         if !rx_status.is_error() {
             let mut map_key = 0usize;
@@ -1700,9 +1729,11 @@ fn tcp4_tls_clienthello_probe(image: EfiHandle, bs: *mut EfiBootServices) -> Efi
             } else if !OSTOOL_ENABLE_BOOT_JUMP || status.is_error() {
                 write_ascii("jump_skipped: boot jump disabled\r\n");
             } else {
-                let exit_status = unsafe { ((*bs).exit_boot_services)(image, map_key) };
+                print_kernel_entry_first16(manifest.entry_point);
+                let boot_info = prepare_kernel_boot_info(bs);
+                let exit_status = exit_boot_services_with_fresh_map(image, bs);
                 if !exit_status.is_error() {
-                    call_kernel(manifest.entry_point);
+                    call_kernel(manifest.entry_point, boot_info);
                 }
                 write_status("exit_boot_services_status: ", exit_status);
                 write_ascii("jump_failed\r\n");

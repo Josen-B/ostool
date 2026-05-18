@@ -1,4 +1,6 @@
 static mut CONSOLE: *mut EfiSimpleTextOutputProtocol = null_mut();
+static mut SERIAL: *mut EfiSerialIoProtocol = null_mut();
+
 impl EfiStatus {
     fn is_error(self) -> bool {
         (self.0 & EFI_ERROR_BIT) != 0
@@ -7,6 +9,25 @@ impl EfiStatus {
 
 fn console() -> *mut EfiSimpleTextOutputProtocol {
     unsafe { CONSOLE }
+}
+
+fn configure_serial_output(bs: *mut EfiBootServices) {
+    let mut serial_ptr: *mut c_void = null_mut();
+    let status = unsafe {
+        ((*bs).locate_protocol)(&EFI_SERIAL_IO_PROTOCOL_GUID, null_mut(), &mut serial_ptr)
+    };
+    if !status.is_error() && !serial_ptr.is_null() {
+        unsafe {
+            SERIAL = serial_ptr as *mut EfiSerialIoProtocol;
+        }
+    }
+    write_status("serial_io_locate_status: ", status);
+    write_ascii("serial_io_enabled: ");
+    write_ascii(if unsafe { SERIAL }.is_null() {
+        "no\r\n"
+    } else {
+        "yes\r\n"
+    });
 }
 
 fn write_ascii(s: &str) {
@@ -31,6 +52,13 @@ fn write_bytes(s: &[u8]) {
             ((*out).output_string)(out, buf.as_ptr());
         }
         pos += n;
+    }
+    let serial = unsafe { SERIAL };
+    if !serial.is_null() {
+        let mut written = s.len();
+        unsafe {
+            ((*serial).write)(serial, &mut written, s.as_ptr() as *mut c_void);
+        }
     }
 }
 
