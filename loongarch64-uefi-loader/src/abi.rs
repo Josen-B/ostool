@@ -19,6 +19,9 @@ const EFI_BUFFER_TOO_SMALL: EfiStatus = EfiStatus(EFI_ERROR_BIT | 5);
 const EFI_NOT_READY: EfiStatus = EfiStatus(EFI_ERROR_BIT | 6);
 const EFI_DEVICE_ERROR: EfiStatus = EfiStatus(EFI_ERROR_BIT | 7);
 const EFI_NOT_FOUND: EfiStatus = EfiStatus(EFI_ERROR_BIT | 14);
+const EFI_NO_MAPPING: EfiStatus = EfiStatus(EFI_ERROR_BIT | 17);
+const EFI_TIMEOUT: EfiStatus = EfiStatus(EFI_ERROR_BIT | 18);
+const EFI_NOT_STARTED: EfiStatus = EfiStatus(EFI_ERROR_BIT | 19);
 
 const EFI_ALLOCATE_ADDRESS: EfiAllocateType = 2;
 const EFI_LOADER_DATA: EfiMemoryType = 2;

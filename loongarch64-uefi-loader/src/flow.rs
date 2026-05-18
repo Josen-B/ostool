@@ -74,6 +74,141 @@ fn try_http_service_handle(
     status
 }
 
+fn warm_up_http_network_child(
+    bs: *mut EfiBootServices,
+    binding: *mut EfiServiceBindingProtocol,
+    index: usize,
+) -> EfiStatus {
+    write_ascii("http_network_warmup_index: ");
+    write_dec(index as u64);
+    write_ascii("\r\n");
+
+    let mut child = null_mut();
+    let status = unsafe { ((*binding).create_child)(binding, &mut child) };
+    write_status("http_network_warmup_create_child_status: ", status);
+    if status.is_error() || child.is_null() {
+        return if status.is_error() {
+            status
+        } else {
+            EFI_UNSUPPORTED
+        };
+    }
+
+    let http = match open_protocol::<EfiHttpProtocol>(bs, child, &EFI_HTTP_PROTOCOL_GUID) {
+        Ok(http) => {
+            write_status("http_network_warmup_protocol_status: ", EFI_SUCCESS);
+            http
+        }
+        Err(status) => {
+            write_status("http_network_warmup_protocol_status: ", status);
+            unsafe {
+                ((*binding).destroy_child)(binding, child);
+            }
+            return status;
+        }
+    };
+
+    configure_tls_ca_on_handle(bs, child, "http_network_warmup_tls_config");
+    let status = configure_http(http);
+    write_status("http_network_warmup_configure_status: ", status);
+    if !status.is_error() {
+        warm_up_http(bs, http);
+    }
+
+    unsafe {
+        ((*binding).destroy_child)(binding, child);
+    }
+    status
+}
+
+fn warm_up_http_network(bs: *mut EfiBootServices) -> EfiStatus {
+    let mut service_count = 0usize;
+    let mut service_handles = null_mut();
+    let status = locate_protocol_handles(
+        bs,
+        &EFI_HTTP_SERVICE_BINDING_PROTOCOL_GUID,
+        &mut service_count,
+        &mut service_handles,
+    );
+    write_status("http_network_warmup_service_status: ", status);
+    write_ascii("http_network_warmup_handle_count: ");
+    write_dec(service_count as u64);
+    write_ascii("\r\n");
+    if status.is_error() || service_count == 0 || service_handles.is_null() {
+        return status;
+    }
+
+    let mut result = EFI_NOT_FOUND;
+    let mut i = 0usize;
+    while i < service_count {
+        let handle = unsafe { *service_handles.add(i) };
+        let binding = match open_protocol::<EfiServiceBindingProtocol>(
+            bs,
+            handle,
+            &EFI_HTTP_SERVICE_BINDING_PROTOCOL_GUID,
+        ) {
+            Ok(binding) => binding,
+            Err(status) => {
+                write_status("http_network_warmup_binding_status: ", status);
+                i += 1;
+                continue;
+            }
+        };
+        result = warm_up_http_network_child(bs, binding, i);
+        if !result.is_error() {
+            break;
+        }
+        i += 1;
+    }
+
+    unsafe {
+        ((*bs).free_pool)(service_handles as *mut c_void);
+    }
+    result
+}
+
+fn try_http_fallback(image: EfiHandle, bs: *mut EfiBootServices) -> EfiStatus {
+    let mut service_count = 0usize;
+    let mut service_handles = null_mut();
+    let status = locate_protocol_handles(
+        bs,
+        &EFI_HTTP_SERVICE_BINDING_PROTOCOL_GUID,
+        &mut service_count,
+        &mut service_handles,
+    );
+    write_status("http_service_binding_status: ", status);
+    write_ascii("http_service_binding_handle_count: ");
+    write_dec(service_count as u64);
+    write_ascii("\r\n");
+    if status.is_error() || service_count == 0 || service_handles.is_null() {
+        return status;
+    }
+
+    let mut result = EFI_NOT_FOUND;
+    let mut i = 0usize;
+    while i < service_count {
+        let handle = unsafe { *service_handles.add(i) };
+        result = try_http_service_handle(image, bs, handle, i);
+        write_status("http_service_binding_try_status: ", result);
+        if !result.is_error() {
+            break;
+        }
+        i += 1;
+    }
+    unsafe {
+        ((*bs).free_pool)(service_handles as *mut c_void);
+    }
+    result
+}
+
+fn stall_loader_retry(bs: *mut EfiBootServices) {
+    unsafe {
+        if let Some(stall) = (*bs).stall {
+            stall(3_000_000);
+        }
+    }
+}
+
 #[unsafe(no_mangle)]
 #[unsafe(link_section = ".text.efi_main")]
 extern "C" fn efi_main(image: EfiHandle, system_table: *mut EfiSystemTable) -> EfiStatus {
@@ -117,39 +252,31 @@ extern "C" fn efi_main(image: EfiHandle, system_table: *mut EfiSystemTable) -> E
     configure_tls_ca(bs);
     run_tcp4_probe(bs);
     run_tls_clienthello_probe(bs);
-    let tcp4_tls_status = tcp4_tls_clienthello_probe(image, bs);
-    if !tcp4_tls_status.is_error() {
-        return EFI_SUCCESS;
-    }
 
-    let mut service_count = 0usize;
-    let mut service_handles = null_mut();
-    let status = locate_protocol_handles(
-        bs,
-        &EFI_HTTP_SERVICE_BINDING_PROTOCOL_GUID,
-        &mut service_count,
-        &mut service_handles,
-    );
-    write_status("http_service_binding_status: ", status);
-    write_ascii("http_service_binding_handle_count: ");
-    write_dec(service_count as u64);
-    write_ascii("\r\n");
-    if status.is_error() || service_count == 0 || service_handles.is_null() {
-        return EFI_SUCCESS;
-    }
+    let mut attempt = 0usize;
+    while attempt < 3 {
+        write_ascii("loader_network_attempt: ");
+        write_dec(attempt as u64);
+        write_ascii("\r\n");
 
-    let mut i = 0usize;
-    while i < service_count {
-        let handle = unsafe { *service_handles.add(i) };
-        let status = try_http_service_handle(image, bs, handle, i);
-        write_status("http_service_binding_try_status: ", status);
-        if !status.is_error() {
-            break;
+        let warmup_status = warm_up_http_network(bs);
+        write_status("http_network_warmup_status: ", warmup_status);
+
+        let tcp4_tls_status = tcp4_tls_clienthello_probe(image, bs);
+        write_status("loader_tcp4_tls_attempt_status: ", tcp4_tls_status);
+        if !tcp4_tls_status.is_error() {
+            return EFI_SUCCESS;
         }
-        i += 1;
+
+        let http_status = try_http_fallback(image, bs);
+        write_status("loader_http_fallback_status: ", http_status);
+        if !http_status.is_error() {
+            return EFI_SUCCESS;
+        }
+
+        stall_loader_retry(bs);
+        attempt += 1;
     }
-    unsafe {
-        ((*bs).free_pool)(service_handles as *mut c_void);
-    }
+
     EFI_SUCCESS
 }
