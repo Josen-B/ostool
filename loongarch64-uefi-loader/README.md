@@ -9,15 +9,13 @@ It intentionally does not use iPXE. The firmware starts:
 EFI/BOOT/BOOTLOONGARCH64.EFI
 ```
 
-The loader is implemented in Rust (`src/main.rs`). The previous C version is
-kept as `loader.c` for reference while the board bring-up is still moving.
+The loader is implemented in Rust (`src/main.rs` and the modules under `src/`).
+There is no C loader path in this directory.
 
-The Rust loader then uses UEFI HTTP Protocol to download `manifest.json`,
-downloads `kernel.bin` to `kernel_load_addr`, prints the entry plan, and keeps
-the final jump behind `ENABLE_BOOT_JUMP=0` until the board-side observations are
-stable. It currently matches the C bring-up path, including the TLS
-Configuration probe and embedded temporary CA certificate used during HTTPS
-validation.
+The Rust loader brings up serial logging, probes the firmware networking
+protocols, downloads `manifest.json` and `kernel.bin` over HTTPS, places the
+kernel at `kernel_load_addr`, prepares framebuffer boot info, and jumps to
+`entry_point` when `ENABLE_BOOT_JUMP=1`.
 
 Build:
 

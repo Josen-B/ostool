@@ -235,6 +235,7 @@ async fn finish_httpboot_session(
     println!("  loader_url: {}", urls.loader_url);
     println!("  manifest_url: {}", urls.manifest_url);
     println!("  kernel_url: {}", urls.kernel_url);
+    println!("Waiting for board on power or reset...");
 
     if config.power_cycle {
         client

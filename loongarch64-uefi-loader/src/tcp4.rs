@@ -1,4 +1,6 @@
 const KERNEL_TRACE_RECORDS: bool = false;
+const TCP4_CONNECT_RETRIES: usize = 6;
+const TCP4_CONNECT_RETRY_DELAY_US: usize = 1_000_000;
 
 fn poll_tcp4(tcp4: *mut EfiTcp4Protocol, token: *const EfiTcp4CompletionToken) -> EfiStatus {
     let mut i = 0usize;
@@ -1246,6 +1248,144 @@ fn close_tcp4_child(
     }
 }
 
+fn tcp4_network_wait_status(status: EfiStatus) -> bool {
+    status == EFI_NO_MAPPING
+        || status == EFI_NOT_READY
+        || status == EFI_NOT_STARTED
+        || status == EFI_TIMEOUT
+}
+
+fn make_tcp4_config(remote: [u8; 4], port: u16) -> EfiTcp4ConfigData {
+    EfiTcp4ConfigData {
+        type_of_service: 0,
+        time_to_live: 64,
+        access_point: EfiTcp4AccessPoint {
+            use_default_address: 1,
+            station_address: [0; 4],
+            subnet_mask: [0; 4],
+            station_port: 0,
+            remote_address: remote,
+            remote_port: port,
+            active_flag: 1,
+        },
+        control_option: EfiTcp4Option {
+            receive_buffer_size: 0,
+            send_buffer_size: 0,
+            max_syn_back_log: 0,
+            connection_timeout: 0,
+            data_retries: 0,
+            fin_timeout: 0,
+            time_wait_timeout: 0,
+            keep_alive_probes: 0,
+            keep_alive_time: 0,
+            keep_alive_interval: 0,
+            enable_nagle: 0,
+            enable_time_stamp: 0,
+            enable_window_scaling: 0,
+            enable_selective_ack: 0,
+            enable_path_mtu_discovery: 0,
+        },
+    }
+}
+
+fn stall_tcp4_connect_retry(bs: *mut EfiBootServices) {
+    unsafe {
+        if let Some(stall) = (*bs).stall {
+            stall(TCP4_CONNECT_RETRY_DELAY_US);
+        }
+    }
+}
+
+fn tcp4_connect_once_with_config(
+    bs: *mut EfiBootServices,
+    tcp4: *mut EfiTcp4Protocol,
+    remote: [u8; 4],
+    port: u16,
+    label: &str,
+) -> EfiStatus {
+    let mut config = make_tcp4_config(remote, port);
+    let status = unsafe { ((*tcp4).configure)(tcp4, &mut config) };
+    write_prefixed_status(label, "_tcp_configure_status", status);
+    if status.is_error() {
+        return status;
+    }
+
+    let mut connect_event = null_mut();
+    let status = unsafe {
+        ((*bs).create_event)(
+            EVT_NOTIFY_SIGNAL,
+            TPL_CALLBACK,
+            Some(noop_event),
+            null_mut(),
+            &mut connect_event,
+        )
+    };
+    write_prefixed_status(label, "_connect_event_status", status);
+    if status.is_error() {
+        unsafe {
+            ((*tcp4).configure)(tcp4, null_mut());
+        }
+        return status;
+    }
+
+    let mut connect_token = EfiTcp4ConnectionToken {
+        completion_token: EfiTcp4CompletionToken {
+            event: connect_event,
+            status: EFI_NOT_READY,
+        },
+    };
+    let submit_status = unsafe { ((*tcp4).connect)(tcp4, &mut connect_token) };
+    write_prefixed_status(label, "_connect_submit_status", submit_status);
+    let connect_status = if submit_status.is_error() {
+        submit_status
+    } else {
+        poll_tcp4(tcp4, &connect_token.completion_token)
+    };
+    write_prefixed_status(label, "_connect_completion", connect_status);
+    write_prefixed_status(
+        label,
+        "_connect_token_status",
+        connect_token.completion_token.status,
+    );
+    unsafe {
+        ((*bs).close_event)(connect_event);
+    }
+
+    if connect_status.is_error() {
+        unsafe {
+            ((*tcp4).configure)(tcp4, null_mut());
+        }
+    }
+    connect_status
+}
+
+fn tcp4_connect_with_network_retry(
+    bs: *mut EfiBootServices,
+    tcp4: *mut EfiTcp4Protocol,
+    remote: [u8; 4],
+    port: u16,
+    label: &str,
+) -> EfiStatus {
+    let mut attempt = 0usize;
+    let mut last_status = EFI_NOT_READY;
+    while attempt < TCP4_CONNECT_RETRIES {
+        write_ascii(label);
+        write_ascii("_connect_attempt: ");
+        write_dec(attempt as u64);
+        write_ascii("\r\n");
+
+        last_status = tcp4_connect_once_with_config(bs, tcp4, remote, port, label);
+        if !last_status.is_error() || !tcp4_network_wait_status(last_status) {
+            return last_status;
+        }
+
+        write_prefixed_status(label, "_connect_wait_status", last_status);
+        stall_tcp4_connect_retry(bs);
+        attempt += 1;
+    }
+    last_status
+}
+
 fn connect_tcp4_child(
     bs: *mut EfiBootServices,
     tcp_binding: *mut EfiServiceBindingProtocol,
@@ -1278,90 +1418,13 @@ fn connect_tcp4_child(
         }
     };
 
-    let mut config = EfiTcp4ConfigData {
-        type_of_service: 0,
-        time_to_live: 64,
-        access_point: EfiTcp4AccessPoint {
-            use_default_address: 1,
-            station_address: [0; 4],
-            subnet_mask: [0; 4],
-            station_port: 0,
-            remote_address: [10, 3, 10, 229],
-            remote_port: 3443,
-            active_flag: 1,
-        },
-        control_option: EfiTcp4Option {
-            receive_buffer_size: 0,
-            send_buffer_size: 0,
-            max_syn_back_log: 0,
-            connection_timeout: 0,
-            data_retries: 0,
-            fin_timeout: 0,
-            time_wait_timeout: 0,
-            keep_alive_probes: 0,
-            keep_alive_time: 0,
-            keep_alive_interval: 0,
-            enable_nagle: 0,
-            enable_time_stamp: 0,
-            enable_window_scaling: 0,
-            enable_selective_ack: 0,
-            enable_path_mtu_discovery: 0,
-        },
-    };
-    let status = unsafe { ((*tcp4).configure)(tcp4, &mut config) };
-    write_prefixed_status(label, "_tcp_configure_status", status);
+    let status = tcp4_connect_with_network_retry(bs, tcp4, [10, 3, 10, 229], 3443, label);
     if status.is_error() {
         unsafe {
             ((*tcp_binding).destroy_child)(tcp_binding, *out_child);
         }
         *out_child = null_mut();
         return Err(status);
-    }
-
-    let mut connect_event = null_mut();
-    let status = unsafe {
-        ((*bs).create_event)(
-            EVT_NOTIFY_SIGNAL,
-            TPL_CALLBACK,
-            Some(noop_event),
-            null_mut(),
-            &mut connect_event,
-        )
-    };
-    write_prefixed_status(label, "_connect_event_status", status);
-    if status.is_error() {
-        unsafe {
-            ((*tcp4).configure)(tcp4, null_mut());
-            ((*tcp_binding).destroy_child)(tcp_binding, *out_child);
-        }
-        *out_child = null_mut();
-        return Err(status);
-    }
-
-    let mut connect_token = EfiTcp4ConnectionToken {
-        completion_token: EfiTcp4CompletionToken {
-            event: connect_event,
-            status: EFI_NOT_READY,
-        },
-    };
-    let submit_status = unsafe { ((*tcp4).connect)(tcp4, &mut connect_token) };
-    write_prefixed_status(label, "_connect_submit_status", submit_status);
-    let connect_status = if submit_status.is_error() {
-        submit_status
-    } else {
-        poll_tcp4(tcp4, &connect_token.completion_token)
-    };
-    write_prefixed_status(label, "_connect_completion", connect_status);
-    unsafe {
-        ((*bs).close_event)(connect_event);
-    }
-    if connect_status.is_error() {
-        unsafe {
-            ((*tcp4).configure)(tcp4, null_mut());
-            ((*tcp_binding).destroy_child)(tcp_binding, *out_child);
-        }
-        *out_child = null_mut();
-        return Err(connect_status);
     }
 
     Ok(tcp4)
@@ -1837,30 +1900,10 @@ fn tcp4_tls_clienthello_probe(image: EfiHandle, bs: *mut EfiBootServices) -> Efi
     };
 
     let mut tcp_child = null_mut();
-    let status = unsafe { ((*tcp_binding).create_child)(tcp_binding, &mut tcp_child) };
-    write_status("tcp4_tls_probe_tcp_create_child_status: ", status);
-    if status.is_error() || tcp_child.is_null() {
-        unsafe {
-            ((*bs).free_pool)(tcp_service_handles as *mut c_void);
-            ((*tls_binding).destroy_child)(tls_binding, tls_child);
-            ((*bs).free_pool)(tls_service_handles as *mut c_void);
-        }
-        return if status.is_error() {
-            status
-        } else {
-            EFI_UNSUPPORTED
-        };
-    }
-
-    let tcp4 = match open_protocol::<EfiTcp4Protocol>(bs, tcp_child, &EFI_TCP4_PROTOCOL_GUID) {
-        Ok(tcp4) => {
-            write_status("tcp4_tls_probe_tcp_protocol_status: ", EFI_SUCCESS);
-            tcp4
-        }
+    let tcp4 = match connect_tcp4_child(bs, tcp_binding, &mut tcp_child, "tcp4_tls_probe") {
+        Ok(tcp4) => tcp4,
         Err(status) => {
-            write_status("tcp4_tls_probe_tcp_protocol_status: ", status);
             unsafe {
-                ((*tcp_binding).destroy_child)(tcp_binding, tcp_child);
                 ((*bs).free_pool)(tcp_service_handles as *mut c_void);
                 ((*tls_binding).destroy_child)(tls_binding, tls_child);
                 ((*bs).free_pool)(tls_service_handles as *mut c_void);
@@ -1868,97 +1911,16 @@ fn tcp4_tls_clienthello_probe(image: EfiHandle, bs: *mut EfiBootServices) -> Efi
             return status;
         }
     };
+    write_status("tcp4_tls_probe_tcp_configure_status: ", EFI_SUCCESS);
+    write_status("tcp4_tls_probe_connect_completion: ", EFI_SUCCESS);
 
-    let mut config = EfiTcp4ConfigData {
-        type_of_service: 0,
-        time_to_live: 64,
-        access_point: EfiTcp4AccessPoint {
-            use_default_address: 1,
-            station_address: [0; 4],
-            subnet_mask: [0; 4],
-            station_port: 0,
-            remote_address: [10, 3, 10, 229],
-            remote_port: 3443,
-            active_flag: 1,
-        },
-        control_option: EfiTcp4Option {
-            receive_buffer_size: 0,
-            send_buffer_size: 0,
-            max_syn_back_log: 0,
-            connection_timeout: 0,
-            data_retries: 0,
-            fin_timeout: 0,
-            time_wait_timeout: 0,
-            keep_alive_probes: 0,
-            keep_alive_time: 0,
-            keep_alive_interval: 0,
-            enable_nagle: 0,
-            enable_time_stamp: 0,
-            enable_window_scaling: 0,
-            enable_selective_ack: 0,
-            enable_path_mtu_discovery: 0,
-        },
-    };
-    let status = unsafe { ((*tcp4).configure)(tcp4, &mut config) };
-    write_status("tcp4_tls_probe_tcp_configure_status: ", status);
-    if status.is_error() {
+    if tcp_child.is_null() {
         unsafe {
-            ((*tcp_binding).destroy_child)(tcp_binding, tcp_child);
             ((*bs).free_pool)(tcp_service_handles as *mut c_void);
             ((*tls_binding).destroy_child)(tls_binding, tls_child);
             ((*bs).free_pool)(tls_service_handles as *mut c_void);
         }
-        return status;
-    }
-
-    let mut connect_event = null_mut();
-    let status = unsafe {
-        ((*bs).create_event)(
-            EVT_NOTIFY_SIGNAL,
-            TPL_CALLBACK,
-            Some(noop_event),
-            null_mut(),
-            &mut connect_event,
-        )
-    };
-    write_status("tcp4_tls_probe_connect_event_status: ", status);
-    if status.is_error() {
-        unsafe {
-            ((*tcp4).configure)(tcp4, null_mut());
-            ((*tcp_binding).destroy_child)(tcp_binding, tcp_child);
-            ((*bs).free_pool)(tcp_service_handles as *mut c_void);
-            ((*tls_binding).destroy_child)(tls_binding, tls_child);
-            ((*bs).free_pool)(tls_service_handles as *mut c_void);
-        }
-        return status;
-    }
-
-    let mut connect_token = EfiTcp4ConnectionToken {
-        completion_token: EfiTcp4CompletionToken {
-            event: connect_event,
-            status: EFI_NOT_READY,
-        },
-    };
-    let submit_status = unsafe { ((*tcp4).connect)(tcp4, &mut connect_token) };
-    write_status("tcp4_tls_probe_connect_submit_status: ", submit_status);
-    let connect_status = if submit_status.is_error() {
-        submit_status
-    } else {
-        poll_tcp4(tcp4, &connect_token.completion_token)
-    };
-    write_status("tcp4_tls_probe_connect_completion: ", connect_status);
-    unsafe {
-        ((*bs).close_event)(connect_event);
-    }
-    if connect_status.is_error() {
-        unsafe {
-            ((*tcp4).configure)(tcp4, null_mut());
-            ((*tcp_binding).destroy_child)(tcp_binding, tcp_child);
-            ((*bs).free_pool)(tcp_service_handles as *mut c_void);
-            ((*tls_binding).destroy_child)(tls_binding, tls_child);
-            ((*bs).free_pool)(tls_service_handles as *mut c_void);
-        }
-        return connect_status;
+        return EFI_UNSUPPORTED;
     }
 
     let tls = match open_protocol::<EfiTlsProtocol>(bs, tls_child, &EFI_TLS_PROTOCOL_GUID) {
